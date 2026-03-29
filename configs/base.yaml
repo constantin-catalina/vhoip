@@ -1,0 +1,49 @@
+# Hiperparametri comuni tuturor dataseturilor
+
+model:
+  clip_model: "ViT-B/16"        # encoder CLIP folosit
+  clip_dim: 512                  # dimensiune feature CLIP
+  hidden_dim: 256                # dimensiune ascunsa BiRNN
+  num_layers: 2                  # straturi BiRNN
+  dropout: 0.3
+
+training:
+  epochs: 50
+  batch_size: 4                  # mic pentru GPU 4-8GB
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-4
+  warmup_epochs: 5               # epoci fara EMA update
+
+  # Coeficienti loss (Eq. 4 din paper)
+  lambda1: 1.0                   # L_Seg
+  lambda2: 0.5                   # L_MI
+  lambda3: 0.5                   # L_Cos
+
+  # EMA
+  rho: 0.9                       # G = rho*G + (1-rho)*V
+
+  # Mixed precision (economiseste VRAM)
+  use_amp: true
+
+  # Gradient clipping (stabilitate)
+  grad_clip: 1.0
+
+data:
+  roi_dim: 2048                  # dimensiune ROI pooling Faster R-CNN
+  num_workers: 2
+  pin_memory: true
+
+evaluation:
+  iou_thresholds: [0.10, 0.25, 0.50]   # pentru F1@10, F1@25, F1@50
+
+logging:
+  log_dir: "logs/"
+  checkpoint_dir: "checkpoints/"
+  save_every: 5                  # salveaza checkpoint la fiecare N epoci
+  log_every: 10                  # logheaza la fiecare N batch-uri
+  local_logging_enabled: true    # daca false, nu scrie TensorBoard/log local
+  local_checkpoints_enabled: true  # daca false, nu salveaza .pth local
+  wandb_enabled: false
+  wandb_project: "vhoip"
+  wandb_entity: null
+  wandb_run_name: null

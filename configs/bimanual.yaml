@@ -1,0 +1,22 @@
+# Configuratie specifica datasetului Bimanual Actions
+# Two-hand HOI - 9 activitati, 6 subiecti
+
+defaults:
+  - base
+
+dataset:
+  name: "bimanual"
+  root: "data/bimanual/"
+  num_classes: 14                # 14 action labels per hand
+  num_subjects: 6
+  cross_validation: "leave_one_subject_out"
+
+  clip_subject: "hand"           # [subject] = hand pentru acest dataset
+  clip_template: "A photo of a hand {verb}"
+
+model:
+  num_classes: 14
+
+training:
+  epochs: 50
+  batch_size: 6

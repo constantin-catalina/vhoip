@@ -1,0 +1,29 @@
+# Configuratie specifica datasetului MPHOI-72
+# Cel mai complex - multi-person, occlusions frecvente
+
+defaults:
+  - base
+
+dataset:
+  name: "mphoi72"
+  root: "data/mphoi72/"
+  num_classes: 13                # sub-activitati
+  num_subjects: 12
+  cross_validation: "two_subject_out"   # 2 subiecti in test
+
+  clip_subject: "person"
+  clip_template: "A photo of a person {verb}"
+
+model:
+  num_classes: 13
+
+training:
+  epochs: 50
+  batch_size: 1                 
+
+logging:
+  wandb_enabled: true
+  wandb_project: "vhoip"
+  wandb_run_name: "{dataset}_fold{fold}"
+  local_logging_enabled: true
+  local_checkpoints_enabled: false

@@ -1,0 +1,23 @@
+# Configuratie specifica datasetului CAD-120
+
+defaults:
+  - base
+
+dataset:
+  name: "cad120"
+  root: "data/cad120/"
+  num_classes_activity: 10       # sub-activitati
+  num_classes_affordance: 12     # caracteristici obiecte
+  num_subjects: 4
+  cross_validation: "leave_one_subject_out"
+
+  # Template CLIP pentru acest dataset (din paper)
+  clip_subject: "person"         # [subject] in template
+  clip_template: "A photo of a person {verb}"
+
+model:
+  num_classes: 10                # override din base
+
+training:
+  epochs: 60
+  batch_size: 8                  # CAD-120 e mai mic, putem creste batch

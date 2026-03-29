@@ -1,0 +1,36 @@
+venv/
+.env
+
+# Date brute (prea mari pentru git)
+data/mphoi72/
+data/cad120/
+data/bimanual/
+
+# Generate automat
+checkpoints/
+logs/
+outputs/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Modele salvate
+*.pth
+*.pt
+*.ckpt
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+wandb/
