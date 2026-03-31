@@ -23,17 +23,24 @@ class MutualInformationLoss(nn.Module):
     def forward(self, scores: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            scores: (N, C) - scorurile discriminatorului pentru toate perechile (z_i, g_k)
+            scores: (N, C) - logit-uri brute din discriminator (fara sigmoid aplicat)
             labels: (N,) - clasa adevarata pentru fiecare entitate (long)
         Returns:
             scalar loss
         """
         N, C = scores.shape
 
-        # Construim target binar: 1 daca (z_i, g_k) sunt din aceeasi clasa
+        # Construim target binar: 1 daca (z_i, g_k) sunt din aceeasi clasa.
+        # Clampam labels pentru a evita erori la scatter_ daca exista etichete
+        # invalide (< 0 sau >= C) — acestea vor produce un target all-zero si
+        # vor fi tratate ca negative, ceea ce este comportamentul corect.
+        safe_labels = labels.clamp(0, C - 1)
         targets = torch.zeros(N, C, device=scores.device)
-        targets.scatter_(1, labels.unsqueeze(1), 1.0)
+        targets.scatter_(1, safe_labels.unsqueeze(1), 1.0)
 
+        # BCEWithLogitsLoss asteapta logit-uri (fara sigmoid aplicat anterior).
+        # Discriminatorul returneaza logit-uri brute — sigmoid e aplicat intern
+        # de BCEWithLogitsLoss pentru stabilitate numerica superioara.
         return self.bce(scores, targets)
 
 

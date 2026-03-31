@@ -51,8 +51,9 @@ class Discriminator(nn.Module):
             nn.Linear(feature_dim, feature_dim),
         )
 
-        # Sigmoid final pentru scorul binar
-        self.sigmoid = nn.Sigmoid()
+        # Nota: NU aplicam sigmoid aici. Returnam logit-uri brute pentru a fi
+        # folosite direct cu BCEWithLogitsLoss (mai stabil numeric decat
+        # sigmoid + BCELoss). Aplicarea sigmoid de doua ori ar distorsiona gradientii.
 
     def forward(
         self,
@@ -67,7 +68,8 @@ class Discriminator(nn.Module):
             G: (C, global_dim)     - reprezentarile globale integrate
 
         Returns:
-            scores: (B, N, C) - scor binar pentru fiecare pereche (z_i, g_k)
+            scores: (B, N, C) - logit-uri brute per pereche (z_i, g_k);
+                    sigmoid aplicat ulterior in BCEWithLogitsLoss
         """
         B, N, D = z.shape
         C = G.shape[0]
@@ -84,7 +86,7 @@ class Discriminator(nn.Module):
 
         # --- Dot product pentru toate perechile ---
         # z_proc: (B, N, D) x g_proc: (C, D).T -> (B, N, C)
+        # Logit-uri brute (B, N, C) — sigmoid aplicat in BCEWithLogitsLoss din losses.py
         scores = torch.einsum("bnd,cd->bnc", z_proc, g_proc)
-        scores = self.sigmoid(scores)             # (B, N, C)
 
         return scores
