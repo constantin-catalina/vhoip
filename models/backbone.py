@@ -18,7 +18,53 @@ Notatie din paper:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple, Optional
+from typing import Optional, Tuple
+
+
+# ---------------------------------------------------------------------------
+# Temporal Segment Pooling
+# ---------------------------------------------------------------------------
+
+def temporal_segment_pooling(
+    z: torch.Tensor,
+    labels: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Grupeaza frame-urile consecutive cu aceeasi eticheta/predictie in segmente
+    si inlocuieste feature-urile fiecarui frame cu media segmentului sau.
+
+    Echivalentul simplificat al segmentarii temporale din ASSIGN (Fig. 2):
+    in loc de un discriminator de segmente antrenat separat, folosim
+    predictiile frame-level ca granita de segment — self-consistent
+    intre antrenare si inferenta si se imbunatateste odata cu modelul.
+
+    Args:
+        z:      (B, M, S, hidden_dim) - frame features per entitate
+        labels: (B, M, S) - predictii sau etichete per frame per entitate (long)
+    Returns:
+        z_seg: (B, M, S, hidden_dim) - aceeasi forma, features mediate per segment
+    """
+    B, M, S, _ = z.shape
+    z_seg = z.clone()
+
+    for b in range(B):
+        for m in range(M):
+            feat = z[b, m]      # (S, D)
+            lbl  = labels[b, m] # (S,)
+
+            # Detecteaza granitele (unde eticheta se schimba)
+            boundaries = [0]
+            for t in range(1, S):
+                if lbl[t] != lbl[t - 1]:
+                    boundaries.append(t)
+            boundaries.append(S)
+
+            # Mean-pooling per segment
+            for i in range(len(boundaries) - 1):
+                s0, s1 = boundaries[i], boundaries[i + 1]
+                z_seg[b, m, s0:s1] = feat[s0:s1].mean(dim=0)
+
+    return z_seg
 
 
 # ---------------------------------------------------------------------------
@@ -188,44 +234,53 @@ class SegmentLevelBiRNN(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Fusion Graph (2G-GCN specific)
+# Fusion Graph (2G-GCN specific) — scaled dot-product attention
 # ---------------------------------------------------------------------------
 
 class FusionGraphLayer(nn.Module):
     """
-    Stratul de graf din 2G-GCN care combina features vizuale si geometrice.
-    Pentru simplitate, daca nu avem keypoints, folosim doar features vizuale
-    cu un GCN standard.
+    Stratul de fuziune din 2G-GCN cu scaled dot-product attention (Fig. 2 din paper).
+    Inlocuieste GCN-ul simplu cu un mecanism de atentie care invata adaptiv
+    relatiile intre entitati (human-object, human-human) per frame.
+
+    A_t = softmax(Q * K^T / sqrt(d_k))
+    out = A_t * V + x  (residual)
     """
 
     def __init__(self, hidden_dim: int = 256, dropout: float = 0.3):
         super().__init__()
 
-        self.gcn = GraphConvolution(hidden_dim, hidden_dim)
+        self.d_k = hidden_dim
+
+        self.W_q = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.W_k = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.W_v = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+
         self.norm = nn.LayerNorm(hidden_dim)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        adj: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x:   (B, M, hidden_dim) - features entitati per frame
-            adj: (B, M, M) - matrice adiacenta; daca None, folosim fully-connected
+            x: (B, M, hidden_dim) - entity features per frame
         Returns:
             (B, M, hidden_dim)
         """
-        B, M, D = x.shape
+        Q = self.W_q(x)   # (B, M, d_k)
+        K = self.W_k(x)   # (B, M, d_k)
+        V = self.W_v(x)   # (B, M, d_k)
 
-        if adj is None:
-            adj = build_adjacency(M, x.device).unsqueeze(0).expand(B, -1, -1)
+        # Scaled dot-product attention
+        scale = self.d_k ** 0.5
+        attn = torch.bmm(Q, K.transpose(1, 2)) / scale   # (B, M, M)
+        attn = torch.softmax(attn, dim=-1)
+        attn = self.dropout(attn)
 
-        out = self.gcn(x, adj)          # (B, M, hidden_dim)
-        out = self.dropout(out)
+        out = torch.bmm(attn, V)          # (B, M, d_k)
+        out = self.out_proj(out)          # (B, M, hidden_dim)
 
-        # Residual connection
+        # Residual + LayerNorm
         out = self.norm(out + x)
         return out
 
@@ -261,7 +316,7 @@ class Backbone2GGCN(nn.Module):
             input_dim=input_dim,
             hidden_dim=hidden_dim,
             num_classes=num_classes,
-            num_layers=1,           # primul nivel = 1 strat
+            num_layers=num_layers,
             dropout=dropout,
         )
 
@@ -273,18 +328,14 @@ class Backbone2GGCN(nn.Module):
         self.segment_birnn = SegmentLevelBiRNN(
             hidden_dim=hidden_dim,
             num_classes=num_classes,
-            num_layers=1,
+            num_layers=num_layers,
             dropout=dropout,
         )
 
         self.hidden_dim = hidden_dim
         self.num_classes = num_classes
 
-    def forward(
-        self,
-        roi_features: torch.Tensor,
-        adj: Optional[torch.Tensor] = None,
-    ) -> dict:
+    def forward(self, roi_features: torch.Tensor) -> dict:
         """
         Args:
             roi_features: (B, S, M, input_dim)
@@ -320,10 +371,16 @@ class Backbone2GGCN(nn.Module):
         z_graph_list = []
         for s in range(S):
             z_s = z[:, :, s, :]                       # (B, M, hidden_dim)
-            z_s = self.fusion_graph(z_s, adj)          # (B, M, hidden_dim)
+            z_s = self.fusion_graph(z_s)               # (B, M, hidden_dim)
             z_graph_list.append(z_s)
 
         z_graph = torch.stack(z_graph_list, dim=2)    # (B, M, S, hidden_dim)
+
+        # --- Pas 2.5: Temporal segment pooling ---
+        # Foloseste predictiile frame-level ca granita de segment.
+        # Self-consistent intre antrenare si inferenta; se imbunatateste odata cu modelul.
+        frame_preds = frame_logits.argmax(dim=-1)      # (B, M, S)
+        z_graph = temporal_segment_pooling(z_graph, frame_preds)
 
         # --- Pas 3: Segment-level BiRNN ---
         # Flatten M si S -> N = M*S entitati

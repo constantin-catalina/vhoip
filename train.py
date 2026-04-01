@@ -56,7 +56,6 @@ def train_one_epoch(model, dataloader, optimizer, criterion, scaler, device, log
 
     for batch_idx, batch in enumerate(dataloader):
         roi = batch["roi_features"].to(device)
-        clip = batch["clip_features"].to(device)   # (B, S, M, clip_dim)
         seg_labels = batch["seg_labels"].to(device)
         frame_labels = batch["frame_labels"].to(device)
 
@@ -66,7 +65,7 @@ def train_one_epoch(model, dataloader, optimizer, criterion, scaler, device, log
             device_type=device.type,
             enabled=cfg.training.use_amp and device.type == "cuda",
         ):
-            outputs = model(roi, clip_features=clip, labels=seg_labels)
+            outputs = model(roi, labels=seg_labels)
             B, N, C = outputs["segment_logits"].shape
             losses = criterion(
                 outputs["segment_logits"].reshape(B * N, C),
@@ -129,20 +128,40 @@ def initialize_global_representation(model, dataloader, device, logger):
     clip_features = torch.cat(clip_features_all, dim=0).to(device)
     labels = torch.cat(labels_all, dim=0).long().to(device)
 
-    # Avertizeaza daca features sunt placeholder (zerouri) — indica ca
-    # extragerea reala CLIP nu a fost inca rulata.
+    # Verifica daca features CLIP sunt placeholder (zerouri).
+    # Daca da, ridica exceptie — antrenamentul cu G_init=0 produce rezultate
+    # invalide (L_Cos compara cu zero, MI loss nu are prior real).
     feature_norm = clip_features.norm(dim=-1).mean().item()
-    if feature_norm < 1e-6:
+    if feature_norm < 0.5:
+        # L2-normalized CLIP features should have norm ~1.0.
+        # If norm << 1.0, the _clip.npy files still contain zero placeholders
+        # or were extracted with the random-projection workaround.
+        # Fall back to text-based G initialization (T is always valid).
         logger.info(
-            "AVERTISMENT: clip_features sunt zero (placeholder). "
-            "G_init va fi initializat cu zerouri — prior-ul CLIP nu va fi utilizat. "
-            "Ruleaza extragerea CLIP (setup_mphoi72.py --extract_clip) inainte de antrenare."
+            f"  clip_features norm medie: {feature_norm:.4f} (placeholder/invalid).\n"
+            f"  Fallback: G initializat din text features T (CLIP text encoder).\n"
+            f"  Pentru CLIP vizual real, ruleaza extract_clip_features() din mphoi72_dataset.py."
         )
-    else:
-        logger.info(f"  clip_features norm medie: {feature_norm:.4f} (OK)")
+        model.initialize_G_from_text()
+        return
 
+    logger.info(f"  clip_features norm medie: {feature_norm:.4f} (OK)")
     model.initialize_G(clip_features, labels)
     logger.info(f"G initializat din {clip_features.shape[0]} entitati de train")
+
+
+def _frames_to_segments(frame_labels):
+    """Group consecutive frames with the same class label into (start, end, class) segments."""
+    if not frame_labels:
+        return []
+    segments = []
+    start = 0
+    for i in range(1, len(frame_labels)):
+        if frame_labels[i] != frame_labels[start]:
+            segments.append((start, i, frame_labels[start]))
+            start = i
+    segments.append((start, len(frame_labels), frame_labels[start]))
+    return segments
 
 
 @torch.no_grad()
@@ -151,15 +170,25 @@ def evaluate(model, dataloader, device, iou_thresholds):
     all_preds, all_gts = [], []
 
     for batch in dataloader:
-        roi = batch["roi_features"].to(device)
-        seg_labels = batch["seg_labels"]
-        outputs = model(roi)
-        pred_classes = outputs["segment_logits"].argmax(dim=-1).cpu()
+        roi = batch["roi_features"].to(device)   # (B, S, M, D)
+        frame_labels = batch["frame_labels"]      # (B, S*M) frame-major
+        B, S, M, _ = roi.shape
 
-        B, N = pred_classes.shape
+        outputs = model(roi)
+        frame_pred = outputs["frame_logits"].argmax(dim=-1).cpu()  # (B, S*M)
+
+        # frame_pred e ordonat frame-major: index [s*M + m] = frame s, entitate m.
+        # Procesam fiecare entitate ca o secventa temporala independenta de lungime S,
+        # astfel incat segmentele sa aiba durate reale si IoU sa varieze cu pragul.
+        frame_pred_3d = frame_pred.reshape(B, S, M)        # (B, S, M)
+        frame_labels_3d = frame_labels.reshape(B, S, M)    # (B, S, M)
+
         for b in range(B):
-            all_preds.append([(i, i + 1, pred_classes[b, i].item()) for i in range(N)])
-            all_gts.append([(i, i + 1, seg_labels[b, i].item()) for i in range(N)])
+            for m in range(M):
+                entity_pred = frame_pred_3d[b, :, m].tolist()    # secventa temporala entitate m
+                entity_gt   = frame_labels_3d[b, :, m].tolist()
+                all_preds.append(_frames_to_segments(entity_pred))
+                all_gts.append(_frames_to_segments(entity_gt))
 
     return compute_metrics_epoch(all_preds, all_gts, iou_thresholds)
 
@@ -174,6 +203,14 @@ def main():
     )
 
     experiment_name = f"{cfg.dataset.name}_fold{args.fold}"
+
+    # Fiecare fold primeste propriul subdirector pentru checkpoints si logs,
+    # altfel fold-urile se suprascriu reciproc (best_model.pth, TensorBoard etc.)
+    # Rezultat: checkpoints/mphoi72_fold0/, checkpoints/mphoi72_fold1/, ...
+    base_checkpoint_dir = OmegaConf.select(cfg, "logging.checkpoint_dir", default="checkpoints/")
+    base_log_dir = OmegaConf.select(cfg, "logging.log_dir", default="logs/")
+    OmegaConf.update(cfg, "logging.checkpoint_dir", os.path.join(base_checkpoint_dir, experiment_name))
+    OmegaConf.update(cfg, "logging.log_dir", os.path.join(base_log_dir, experiment_name))
 
     wandb_enabled_cfg = bool(OmegaConf.select(cfg, "logging.wandb_enabled", default=False))
     wandb_project_cfg = OmegaConf.select(cfg, "logging.wandb_project", default="vhoip")
@@ -201,6 +238,8 @@ def main():
         wandb_entity=wandb_entity,
         wandb_run_name=wandb_run_name,
         wandb_config=OmegaConf.to_container(cfg, resolve=True),
+        wandb_group=cfg.dataset.name,
+        wandb_job_type="fold",
         enable_local_logging=local_logging_enabled,
     )
     logger.info(f"Config: {args.config} | Device: {device} | Fold: {args.fold}")
@@ -302,6 +341,7 @@ def main():
                     os.remove(temp_best_path)
 
     logger.info(f"\nAntrenare finalizata. Best FSUM: {best_fsum:.1f}")
+    logger.log_summary({"best_fsum": best_fsum, "fold": args.fold})
     logger.close()
 
 

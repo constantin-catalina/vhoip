@@ -40,9 +40,10 @@ class Discriminator(nn.Module):
 
         # Bratul pentru reprezentarile globale g_k
         # g_k are dimensiunea CLIP (512), il proiectam la feature_dim
+        # Ordinea corecta din Eq. 1: sigma1(g_k) -> MLP
         self.global_mlp = nn.Sequential(
-            nn.Linear(global_dim, feature_dim),
-            nn.Sigmoid(),   # sigma1 din paper
+            nn.Sigmoid(),                        # sigma1 din paper (aplicat prima)
+            nn.Linear(global_dim, feature_dim),  # MLP dupa sigmoid
         )
 
         # Bratul pentru features locale z_i

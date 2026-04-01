@@ -8,7 +8,7 @@ dataset:
   name: "mphoi72"
   root: "data/mphoi72/"
   num_classes: 13                # sub-activitati
-  num_subjects: 12
+  num_subjects: 8
   cross_validation: "two_subject_out"   # 2 subiecti in test
 
   clip_subject: "person"
@@ -26,4 +26,4 @@ logging:
   wandb_project: "vhoip"
   wandb_run_name: "{dataset}_fold{fold}"
   local_logging_enabled: true
-  local_checkpoints_enabled: false
+  local_checkpoints_enabled: true

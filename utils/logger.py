@@ -23,6 +23,8 @@ class Logger:
         wandb_entity: str = None,
         wandb_run_name: str = None,
         wandb_config: dict = None,
+        wandb_group: str = None,
+        wandb_job_type: str = "fold",
         enable_local_logging: bool = True,
     ):
         self.enable_local_logging = enable_local_logging
@@ -54,6 +56,8 @@ class Logger:
                     entity=wandb_entity,
                     name=wandb_run_name or experiment_name,
                     config=wandb_config,
+                    group=wandb_group,
+                    job_type=wandb_job_type,
                 )
                 self.log.info("W&B initializat cu succes")
 
@@ -122,6 +126,12 @@ class Logger:
             aliases.append("best")
 
         self.wandb_run.log_artifact(artifact, aliases=aliases)
+
+    def log_summary(self, metrics: dict) -> None:
+        """Salveaza metricile finale in wandb run summary (vizibile in runs table)."""
+        if self.wandb_run is not None:
+            for k, v in metrics.items():
+                self.wandb_run.summary[k] = v
 
     def close(self) -> None:
         if self.writer is not None:

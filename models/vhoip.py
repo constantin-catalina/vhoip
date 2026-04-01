@@ -16,7 +16,7 @@ Pipeline inference:
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
 from omegaconf import DictConfig
 from typing import Dict, Optional, List
 
@@ -121,6 +121,15 @@ class VHOIP(nn.Module):
         print(f"  Text features T precomputed: {T.shape}")
         return T
 
+    def initialize_G_from_text(self) -> None:
+        """
+        Initializeaza G din text features T (CLIP text encoder).
+        Fallback cand features CLIP vizuale nu sunt disponibile sau sunt invalide.
+        T este deja in spatiul CLIP 512-dim, corect normalizat L2.
+        """
+        self.global_rep.initialize(self.T.clone())
+        print(f"  G initializat din text features T (shape: {self.T.shape})")
+
     def initialize_G(self, clip_visual_features: torch.Tensor, labels: torch.Tensor) -> None:
         """
         Initializeaza G cu prototipurile CLIP (G_init).
@@ -139,9 +148,7 @@ class VHOIP(nn.Module):
     def forward(
         self,
         roi_features: torch.Tensor,
-        clip_features: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
-        adj: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass VHOIP.
@@ -156,7 +163,7 @@ class VHOIP(nn.Module):
             dict cu toate output-urile necesare pentru loss si evaluare
         """
         # --- Pas 1: Backbone ---
-        backbone_out = self.backbone(roi_features, adj)
+        backbone_out = self.backbone(roi_features)
         z = backbone_out["z"]                          # (B, N, hidden_dim)
         frame_logits = backbone_out["frame_logits"]    # (B, N, C)
         segment_logits = backbone_out["segment_logits"]  # (B, N, C)

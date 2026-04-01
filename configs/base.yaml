@@ -43,7 +43,7 @@ logging:
   log_every: 10                  # logheaza la fiecare N batch-uri
   local_logging_enabled: true    # daca false, nu scrie TensorBoard/log local
   local_checkpoints_enabled: true  # daca false, nu salveaza .pth local
-  wandb_enabled: false
+  wandb_enabled: true
   wandb_project: "vhoip"
   wandb_entity: null
   wandb_run_name: null

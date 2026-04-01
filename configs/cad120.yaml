@@ -20,4 +20,4 @@ model:
 
 training:
   epochs: 60
-  batch_size: 8                  # CAD-120 e mai mic, putem creste batch
+  batch_size: 1                  # secventele au S variabil, nu se pot bate fara padding
