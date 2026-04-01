@@ -16,6 +16,7 @@ from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
 from data.dataset import get_dataset, CAD120Dataset, MPHOI72Dataset, BimanualDataset
+from data.mphoi72_dataset import collate_fn
 from models.vhoip import VHOIP
 from models.losses import VHOIPLoss
 from utils.logger import Logger
@@ -53,9 +54,13 @@ def train_one_epoch(model, dataloader, optimizer, criterion, scaler, device, log
     model.train()
     model.set_inference_mode(False)
     total_losses = {}
+    warmup_epochs = int(OmegaConf.select(cfg, "training.warmup_epochs", default=0))
+    current_stage = 1 if epoch < warmup_epochs else 2
 
     for batch_idx, batch in enumerate(dataloader):
         roi = batch["roi_features"].to(device)
+        geo = batch["geo_features"].to(device)
+        entity_types = batch["entity_types"].to(device)
         seg_labels = batch["seg_labels"].to(device)
         frame_labels = batch["frame_labels"].to(device)
 
@@ -65,15 +70,21 @@ def train_one_epoch(model, dataloader, optimizer, criterion, scaler, device, log
             device_type=device.type,
             enabled=cfg.training.use_amp and device.type == "cuda",
         ):
-            outputs = model(roi, labels=seg_labels)
-            B, N, C = outputs["segment_logits"].shape
+            outputs = model(
+                roi_features=roi,
+                geo_features=geo,
+                entity_types=entity_types,
+                labels=seg_labels,
+            )
             losses = criterion(
-                outputs["segment_logits"].reshape(B * N, C),
-                outputs["frame_logits"].reshape(B * N, C),
-                outputs["mi_scores"].reshape(B * N, C),
-                outputs["cos_similarities"].reshape(B * N, C),
-                seg_labels.reshape(B * N),
-                frame_labels.reshape(B * N),
+                segment_logits=outputs["segment_logits"],
+                frame_logits=outputs["frame_logits"],
+                u_soft=outputs["u_soft"],
+                mi_scores=outputs["mi_scores"],
+                cos_similarities=outputs["cos_similarities"],
+                segment_labels=seg_labels,
+                frame_labels=frame_labels,
+                training_stage=current_stage,
             )
 
         scaler.scale(losses["total"]).backward()
@@ -171,10 +182,18 @@ def evaluate(model, dataloader, device, iou_thresholds):
 
     for batch in dataloader:
         roi = batch["roi_features"].to(device)   # (B, S, M, D)
+        geo = batch["geo_features"].to(device)
+        entity_types = batch["entity_types"].to(device)
+        seg_labels = batch["seg_labels"].to(device)
         frame_labels = batch["frame_labels"]      # (B, S*M) frame-major
         B, S, M, _ = roi.shape
 
-        outputs = model(roi)
+        outputs = model(
+            roi_features=roi,
+            geo_features=geo,
+            entity_types=entity_types,
+            labels=seg_labels,
+        )
         frame_pred = outputs["frame_logits"].argmax(dim=-1).cpu()  # (B, S*M)
 
         # frame_pred e ordonat frame-major: index [s*M + m] = frame s, entitate m.
@@ -250,8 +269,9 @@ def main():
     train_loader = DataLoader(
         train_ds, batch_size=cfg.training.batch_size,
         shuffle=True, num_workers=cfg.data.num_workers, pin_memory=cfg.data.pin_memory,
+        collate_fn=collate_fn,
     )
-    val_loader = DataLoader(val_ds, batch_size=1, shuffle=False)
+    val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, collate_fn=collate_fn)
     logger.info(f"Train: {len(train_ds)} video-uri | Val: {len(val_ds)} video-uri")
 
     label_names = get_label_names(cfg.dataset.name)
