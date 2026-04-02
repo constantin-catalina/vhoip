@@ -303,6 +303,11 @@ def main():
         start_epoch = ckpt["epoch"] + 1
         best_fsum = ckpt["metrics"].get("fsum", 0.0)
         logger.info(f"Resuming din epoch {start_epoch}, best FSUM={best_fsum:.1f}")
+        # G buffer-ul a fost restaurat din checkpoint via state_dict().
+        # _initialized este un atribut Python simplu (nu tensor/buffer), deci
+        # nu se salveaza/restaureaza automat — trebuie setat manual dupa resume.
+        model.global_rep._initialized = True
+        logger.info("G marcat ca initializat (restaurat din checkpoint).")
     else:
         logger.info("Initializez G din prototipuri CLIP vizuale (train set)...")
         initialize_global_representation(model, train_loader, device, logger)
