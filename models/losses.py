@@ -130,7 +130,6 @@ class SegmentationLoss(nn.Module):
     def __init__(self, sigma: float = 4.0):
         super().__init__()
         self.sigma = sigma
-        self.bce   = nn.BCELoss(reduction='none')
 
     def forward(
         self,
@@ -156,8 +155,14 @@ class SegmentationLoss(nn.Module):
         # Masca pozitiile valide (nu padding)
         valid_mask = (frame_labels != -1).float()   # (B, N)
 
-        # BCE per pozitie
-        bce_per_pos = self.bce(u_soft.clamp(1e-6, 1 - 1e-6), boundary_smooth)  # (B, N)
+        # BCEWithLogits este sigur sub autocast; convertim probabilitatile deja
+        # produse de detector in logits echivalenti pentru a pastra aceeasi tinta.
+        u_logits = torch.logit(u_soft.float().clamp(1e-6, 1 - 1e-6))
+        bce_per_pos = F.binary_cross_entropy_with_logits(
+            u_logits,
+            boundary_smooth.float(),
+            reduction='none',
+        )
 
         # Media doar pe pozitiile valide
         loss = (bce_per_pos * valid_mask).sum() / valid_mask.sum().clamp(min=1)

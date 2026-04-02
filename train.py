@@ -16,7 +16,7 @@ from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
 from data.dataset import get_dataset, CAD120Dataset, MPHOI72Dataset, BimanualDataset
-from data.mphoi72_dataset import collate_fn
+from data.mphoi72_dataset import MPHOI72ZarrDataset, collate_fn
 from models.vhoip import VHOIP
 from models.losses import VHOIPLoss
 from utils.logger import Logger
@@ -54,8 +54,7 @@ def train_one_epoch(model, dataloader, optimizer, criterion, scaler, device, log
     model.train()
     model.set_inference_mode(False)
     total_losses = {}
-    warmup_epochs = int(OmegaConf.select(cfg, "training.warmup_epochs", default=0))
-    current_stage = 1 if epoch < warmup_epochs else 2
+    current_stage = cfg.training.get("training_stage", 2)
 
     for batch_idx, batch in enumerate(dataloader):
         roi = batch["roi_features"].to(device)
@@ -75,6 +74,7 @@ def train_one_epoch(model, dataloader, optimizer, criterion, scaler, device, log
                 geo_features=geo,
                 entity_types=entity_types,
                 labels=seg_labels,
+                training_stage=current_stage,
             )
             losses = criterion(
                 segment_logits=outputs["segment_logits"],
@@ -263,8 +263,12 @@ def main():
     )
     logger.info(f"Config: {args.config} | Device: {device} | Fold: {args.fold}")
 
-    train_ds = get_dataset(cfg.dataset.name, root=cfg.dataset.root, split="train", fold=args.fold)
-    val_ds = get_dataset(cfg.dataset.name, root=cfg.dataset.root, split="test", fold=args.fold)
+    if cfg.dataset.name == "mphoi72":
+        train_ds = MPHOI72ZarrDataset(cfg.dataset.root, split="train", fold=args.fold)
+        val_ds   = MPHOI72ZarrDataset(cfg.dataset.root, split="test",  fold=args.fold)
+    else:
+        train_ds = get_dataset(cfg.dataset.name, root=cfg.dataset.root, split="train", fold=args.fold)
+        val_ds   = get_dataset(cfg.dataset.name, root=cfg.dataset.root, split="test",  fold=args.fold)
 
     train_loader = DataLoader(
         train_ds, batch_size=cfg.training.batch_size,
