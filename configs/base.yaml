@@ -10,7 +10,7 @@ model:
 training:
   epochs: 50
   batch_size: 4                  # mic pentru GPU 4-8GB
-  learning_rate: 1.0e-4
+  learning_rate: 5.0e-5
   weight_decay: 1.0e-4
   warmup_epochs: 5               # epoci fara EMA update
 
@@ -26,7 +26,7 @@ training:
   use_amp: true
 
   # Gradient clipping (stabilitate)
-  grad_clip: 1.0
+  grad_clip: 0.5
 
 data:
   roi_dim: 2048                  # dimensiune ROI pooling Faster R-CNN

@@ -54,7 +54,23 @@ def train_one_epoch(model, dataloader, optimizer, criterion, scaler, device, log
     model.train()
     model.set_inference_mode(False)
     total_losses = {}
-    current_stage = cfg.training.get("training_stage", 2)
+    stage1_epochs = cfg.training.get("stage1_epochs", 10)
+    current_stage = 1 if epoch < stage1_epochs else 2
+
+    # Ramp L_Seg weight linearly from lambda1_start to lambda1_final
+    # over stage2 epochs, to avoid the sudden loss spike at transition
+    if current_stage == 1:
+        lambda1 = 0.0
+    else:
+        lambda1_start = cfg.training.get("lambda1_start", 0.1)
+        lambda1_final = cfg.training.get("lambda1_final", cfg.training.lambda1)
+        ramp_epochs   = cfg.training.get("stage2_epochs", 40)
+        stage2_epoch  = epoch - stage1_epochs          # 0-indexed within stage 2
+        t             = min(stage2_epoch / ramp_epochs, 1.0)
+        lambda1       = lambda1_start + t * (lambda1_final - lambda1_start)
+
+    # Update criterion's lambda1 dynamically
+    criterion.lambda1 = lambda1
 
     for batch_idx, batch in enumerate(dataloader):
         roi = batch["roi_features"].to(device)
@@ -194,7 +210,7 @@ def evaluate(model, dataloader, device, iou_thresholds):
             entity_types=entity_types,
             labels=seg_labels,
         )
-        frame_pred = outputs["frame_logits"].argmax(dim=-1).cpu()  # (B, S*M)
+        frame_pred = outputs["segment_logits"].argmax(dim=-1).cpu()  # (B, S*M)
 
         # frame_pred e ordonat frame-major: index [s*M + m] = frame s, entitate m.
         # Procesam fiecare entitate ca o secventa temporala independenta de lungime S,
@@ -293,7 +309,15 @@ def main():
         lr=cfg.training.learning_rate,
         weight_decay=cfg.training.weight_decay,
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.training.epochs)
+    if cfg.training.get("scheduler", "cosine") == "plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="max", patience=cfg.training.get("scheduler_patience", 5),
+            factor=cfg.training.get("scheduler_factor", 0.5), verbose=True,
+        )
+        use_plateau = True
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.training.epochs)
+        use_plateau = False
     criterion = VHOIPLoss(cfg.training.lambda1, cfg.training.lambda2, cfg.training.lambda3)
     scaler = torch.amp.GradScaler("cuda", enabled=cfg.training.use_amp and device.type == "cuda")
 
@@ -308,6 +332,20 @@ def main():
         # nu se salveaza/restaureaza automat — trebuie setat manual dupa resume.
         model.global_rep._initialized = True
         logger.info("G marcat ca initializat (restaurat din checkpoint).")
+
+        # Reset scheduler so Stage 2 gets its own full cycle
+        stage2_epochs = cfg.training.epochs - start_epoch
+        if use_plateau:
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode="max", patience=cfg.training.get("scheduler_patience", 5),
+                factor=cfg.training.get("scheduler_factor", 0.5), verbose=True,
+            )
+            logger.info("Scheduler resetat: ReduceLROnPlateau.")
+        else:
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=stage2_epochs
+            )
+            logger.info(f"Scheduler resetat: CosineAnnealingLR cu T_max={stage2_epochs} epoci.")
     else:
         logger.info("Initializez G din prototipuri CLIP vizuale (train set)...")
         initialize_global_representation(model, train_loader, device, logger)
@@ -322,11 +360,15 @@ def main():
         )
         logger.log_losses(train_losses, epoch)
         logger.info(f"  Train loss: {train_losses['total']:.4f}")
-        scheduler.step()
+        if not use_plateau:
+            scheduler.step()
 
         if (epoch + 1) % 5 == 0 or epoch == cfg.training.epochs - 1:
             metrics = evaluate(model, val_loader, device, cfg.evaluation.iou_thresholds)
             logger.log_metrics(metrics, epoch)
+
+            if use_plateau:
+                scheduler.step(metrics["fsum"])
 
             is_best = metrics["fsum"] > best_fsum
             if is_best:

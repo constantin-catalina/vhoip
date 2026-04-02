@@ -56,9 +56,15 @@ def evaluate_fold(model, dataloader, device, iou_thresholds):
 
     for batch in dataloader:
         roi = batch["roi_features"].to(device)
+        geo = batch["geo_features"].to(device)
+        entity_types = batch["entity_types"].to(device)
         seg_labels = batch["seg_labels"]
 
-        outputs = model(roi)
+        outputs = model(
+            roi_features=roi,
+            geo_features=geo,
+            entity_types=entity_types,
+        )
         pred_classes = outputs["segment_logits"].argmax(dim=-1).cpu()
 
         B, N = pred_classes.shape

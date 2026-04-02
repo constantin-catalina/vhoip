@@ -188,29 +188,25 @@ class SpatialMessagePassing(nn.Module):
         entity_types: torch.Tensor,   # (B, M) int64
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         B, M, FD = combined.shape
-        m_inter = torch.zeros_like(combined)
-        m_intra = torch.zeros_like(combined)
+        scale = FD ** 0.5
 
-        for b in range(B):
-            types_b = entity_types[b]
-            feat_b  = combined[b]      # (M, 2D)
+        scores = torch.bmm(combined, combined.transpose(1, 2)) / scale  # (B, M, M)
 
-            for e in range(M):
-                ce = types_b[e].item()
-                q  = feat_b[e].unsqueeze(0).unsqueeze(0)   # (1, 1, 2D)
+        types_row = entity_types.unsqueeze(2).expand(B, M, M)  # (B, M, M) query types
+        types_col = entity_types.unsqueeze(1).expand(B, M, M)  # (B, M, M) key types
+        diag      = torch.eye(M, dtype=torch.bool, device=combined.device).unsqueeze(0)
 
-                inter_idx = (types_b != ce).nonzero(as_tuple=True)[0]
-                if inter_idx.numel() > 0:
-                    kv = feat_b[inter_idx].unsqueeze(0)     # (1, K, 2D)
-                    m_inter[b, e] = scaled_dot_attention(q, kv).squeeze()
+        inter_mask = types_col != types_row           # (B, M, M) — different class
+        intra_mask = (types_col == types_row) & ~diag  # (B, M, M) — same class, not self
 
-                intra_idx = (types_b == ce).nonzero(as_tuple=True)[0]
-                intra_idx = intra_idx[intra_idx != e]
-                if intra_idx.numel() > 0:
-                    kv = feat_b[intra_idx].unsqueeze(0)
-                    m_intra[b, e] = scaled_dot_attention(q, kv).squeeze()
+        inter_w = torch.nan_to_num(
+            torch.softmax(scores.masked_fill(~inter_mask, float('-inf')), dim=-1), nan=0.0
+        )
+        intra_w = torch.nan_to_num(
+            torch.softmax(scores.masked_fill(~intra_mask, float('-inf')), dim=-1), nan=0.0
+        )
 
-        return m_inter, m_intra    # each (B, M, 2D)
+        return torch.bmm(inter_w, combined), torch.bmm(intra_w, combined)
 
 
 # ---------------------------------------------------------------------------
@@ -274,29 +270,25 @@ def segment_message_passing(
     Identic cu SpatialMessagePassing dar opereaza pe h_s (D) in loc de [x;h](2D).
     """
     B, M, D = h_s.shape
-    m_inter = torch.zeros_like(h_s)
-    m_intra = torch.zeros_like(h_s)
+    scale = D ** 0.5
 
-    for b in range(B):
-        types_b = entity_types[b]
-        feat_b  = h_s[b]          # (M, D)
+    scores = torch.bmm(h_s, h_s.transpose(1, 2)) / scale  # (B, M, M)
 
-        for e in range(M):
-            ce = types_b[e].item()
-            q  = feat_b[e].unsqueeze(0).unsqueeze(0)
+    types_row = entity_types.unsqueeze(2).expand(B, M, M)
+    types_col = entity_types.unsqueeze(1).expand(B, M, M)
+    diag      = torch.eye(M, dtype=torch.bool, device=h_s.device).unsqueeze(0)
 
-            inter_idx = (types_b != ce).nonzero(as_tuple=True)[0]
-            if inter_idx.numel() > 0:
-                kv = feat_b[inter_idx].unsqueeze(0)
-                m_inter[b, e] = scaled_dot_attention(q, kv).squeeze()
+    inter_mask = types_col != types_row
+    intra_mask = (types_col == types_row) & ~diag
 
-            intra_idx = (types_b == ce).nonzero(as_tuple=True)[0]
-            intra_idx = intra_idx[intra_idx != e]
-            if intra_idx.numel() > 0:
-                kv = feat_b[intra_idx].unsqueeze(0)
-                m_intra[b, e] = scaled_dot_attention(q, kv).squeeze()
+    inter_w = torch.nan_to_num(
+        torch.softmax(scores.masked_fill(~inter_mask, float('-inf')), dim=-1), nan=0.0
+    )
+    intra_w = torch.nan_to_num(
+        torch.softmax(scores.masked_fill(~intra_mask, float('-inf')), dim=-1), nan=0.0
+    )
 
-    return m_inter, m_intra   # each (B, M, D)
+    return torch.bmm(inter_w, h_s), torch.bmm(intra_w, h_s)
 
 
 # ---------------------------------------------------------------------------

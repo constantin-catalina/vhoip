@@ -560,9 +560,8 @@ def _extract_labels(
             labels_per_entity.append(lbl_arr)
 
         if labels_per_entity:
-            # Construim (S, M) si aplatizam la (S*M,)
-            # Ordinea: entity0_frame0, entity0_frame1, ... -> (S*M,) dupa flatten
-            # dar modelul nostru asteapta (S, M) -> (N,) cu N=S*M
+            # Construim (S, M) si aplatizam la (S*M,) in ordine frame-major (C-order):
+            # [s0m0, s0m1, ..., s0mM-1, s1m0, ...] — identic cu bms_to_bn din backbone.
             label_matrix = np.stack(labels_per_entity, axis=1)  # (S, M)
             flat_labels = label_matrix.flatten()                  # (S*M,)
             return flat_labels, flat_labels.copy()

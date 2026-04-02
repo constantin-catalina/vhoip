@@ -19,10 +19,15 @@ model:
 
 training:
   epochs: 50
-  batch_size: 1        
-  training_stage: 2
-  stage1_epochs: 10
-  stage2_epochs: 50        
+  batch_size: 1
+  stage1_epochs: 15
+  stage2_epochs: 50
+  lambda1_start: 0.1      # L_Seg starts small
+  lambda1_final: 1.0      # L_Seg reaches full weight by epoch 30
+
+  scheduler: "plateau"        # add this key
+  scheduler_patience: 5       # reduce LR if no improvement for 5 evals
+  scheduler_factor: 0.5       # halve the LR
 
 logging:
   wandb_enabled: true

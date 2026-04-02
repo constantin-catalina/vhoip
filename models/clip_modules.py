@@ -312,7 +312,7 @@ class IntegratedGlobalRepresentation(nn.Module):
         # Calculeaza V (prototipurile V-HOI din acest epoch)
         V = self.prototyping(collected_features, labels)   # (C, feature_dim)
 
-        if epoch >= self.warmup_epochs:
+        if epoch >= self.warmup_epochs - 1:
             # EMA update: G = rho*G + (1-rho)*V
             self.G = self.rho * self.G + (1 - self.rho) * V
             self.G = F.normalize(self.G, dim=-1)   # re-normalizare
