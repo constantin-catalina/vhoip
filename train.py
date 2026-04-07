@@ -81,6 +81,11 @@ def train_one_epoch(model, dataloader, optimizer, criterion, scaler, device, log
 
         optimizer.zero_grad()
 
+        # Build anticipation labels: segment_labels shifted one step forward in time.
+        # ant_labels[b, t] = seg_labels[b, t+1]; last position is set to -1 (ignored).
+        ant_labels = seg_labels.roll(-1, dims=1)
+        ant_labels[:, -1] = -1
+
         with torch.amp.autocast(
             device_type=device.type,
             enabled=cfg.training.use_amp and device.type == "cuda",
@@ -100,6 +105,7 @@ def train_one_epoch(model, dataloader, optimizer, criterion, scaler, device, log
                 cos_similarities=outputs["cos_similarities"],
                 segment_labels=seg_labels,
                 frame_labels=frame_labels,
+                anticipation_labels=ant_labels,
                 training_stage=current_stage,
             )
 
@@ -116,6 +122,7 @@ def train_one_epoch(model, dataloader, optimizer, criterion, scaler, device, log
             logger.info(
                 f"  [{batch_idx}/{len(dataloader)}] "
                 f"Loss={losses['total'].item():.4f} "
+                f"Ant={losses['l_ant'].item():.4f} "
                 f"MI={losses['l_mi'].item():.4f} "
                 f"Cos={losses['l_cos'].item():.4f}"
             )
@@ -304,10 +311,9 @@ def main():
         f"frozen (CLIP)={stats['frozen']:,}"
     )
 
-    optimizer = torch.optim.AdamW(
+    optimizer = torch.optim.Adam(
         [p for p in model.parameters() if p.requires_grad],
         lr=cfg.training.learning_rate,
-        weight_decay=cfg.training.weight_decay,
     )
     if cfg.training.get("scheduler", "cosine") == "plateau":
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -318,7 +324,12 @@ def main():
     else:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.training.epochs)
         use_plateau = False
-    criterion = VHOIPLoss(cfg.training.lambda1, cfg.training.lambda2, cfg.training.lambda3)
+    criterion = VHOIPLoss(
+        cfg.training.lambda1,
+        cfg.training.lambda2,
+        cfg.training.lambda3,
+        lambda_ant=cfg.training.get("lambda_ant", 1.0),
+    )
     scaler = torch.amp.GradScaler("cuda", enabled=cfg.training.use_amp and device.type == "cuda")
 
     start_epoch, best_fsum = 0, 0.0
@@ -363,53 +374,49 @@ def main():
         if not use_plateau:
             scheduler.step()
 
-        if (epoch + 1) % 5 == 0 or epoch == cfg.training.epochs - 1:
-            metrics = evaluate(model, val_loader, device, cfg.evaluation.iou_thresholds)
-            logger.log_metrics(metrics, epoch)
+        metrics = evaluate(model, val_loader, device, cfg.evaluation.iou_thresholds)
+        logger.log_metrics(metrics, epoch)
 
-            if use_plateau:
-                scheduler.step(metrics["fsum"])
+        if use_plateau:
+            scheduler.step(metrics["fsum"])
 
-            is_best = metrics["fsum"] > best_fsum
-            if is_best:
-                best_fsum = metrics["fsum"]
+        is_best = metrics["fsum"] > best_fsum
+        if is_best:
+            best_fsum = metrics["fsum"]
+            saved = save_checkpoint(
+                model,
+                optimizer,
+                epoch,
+                metrics,
+                cfg.logging.checkpoint_dir,
+                is_best=True,
+                save_local=local_checkpoints_enabled,
+            )
 
-            if (epoch + 1) % cfg.logging.save_every == 0 or is_best:
-                saved = save_checkpoint(
-                    model,
-                    optimizer,
-                    epoch,
-                    metrics,
-                    cfg.logging.checkpoint_dir,
-                    is_best,
-                    save_local=local_checkpoints_enabled,
-                )
+            # W&B-only mode: dump a temporary checkpoint file for artifact upload.
+            temp_ckpt_path = None
+            temp_best_path = None
+            if not local_checkpoints_enabled and use_wandb:
+                fd, temp_ckpt_path = tempfile.mkstemp(prefix=f"{experiment_name}_ep{epoch:03d}_", suffix=".pth")
+                os.close(fd)
+                torch.save(saved["state"], temp_ckpt_path)
 
-                # W&B-only mode: dump a temporary checkpoint file for artifact upload.
-                temp_ckpt_path = None
-                temp_best_path = None
-                if not local_checkpoints_enabled and use_wandb:
-                    fd, temp_ckpt_path = tempfile.mkstemp(prefix=f"{experiment_name}_ep{epoch:03d}_", suffix=".pth")
-                    os.close(fd)
-                    torch.save(saved["state"], temp_ckpt_path)
+                fd2, temp_best_path = tempfile.mkstemp(prefix=f"{experiment_name}_best_ep{epoch:03d}_", suffix=".pth")
+                os.close(fd2)
+                torch.save(saved["state"], temp_best_path)
 
-                    if is_best:
-                        fd2, temp_best_path = tempfile.mkstemp(prefix=f"{experiment_name}_best_ep{epoch:03d}_", suffix=".pth")
-                        os.close(fd2)
-                        torch.save(saved["state"], temp_best_path)
+            logger.log_checkpoint_artifact(
+                checkpoint_path=temp_ckpt_path or saved["checkpoint"],
+                best_checkpoint_path=temp_best_path or saved.get("best_checkpoint"),
+                epoch=epoch,
+                metrics=metrics,
+                is_best=True,
+            )
 
-                logger.log_checkpoint_artifact(
-                    checkpoint_path=temp_ckpt_path or saved["checkpoint"],
-                    best_checkpoint_path=temp_best_path or saved.get("best_checkpoint"),
-                    epoch=epoch,
-                    metrics=metrics,
-                    is_best=is_best,
-                )
-
-                if temp_ckpt_path and os.path.exists(temp_ckpt_path):
-                    os.remove(temp_ckpt_path)
-                if temp_best_path and os.path.exists(temp_best_path):
-                    os.remove(temp_best_path)
+            if temp_ckpt_path and os.path.exists(temp_ckpt_path):
+                os.remove(temp_ckpt_path)
+            if temp_best_path and os.path.exists(temp_best_path):
+                os.remove(temp_best_path)
 
     logger.info(f"\nAntrenare finalizata. Best FSUM: {best_fsum:.1f}")
     logger.log_summary({"best_fsum": best_fsum, "fold": args.fold})

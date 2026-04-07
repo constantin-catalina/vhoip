@@ -101,6 +101,15 @@ class Discriminator(nn.Module):
         B, N, _ = z.shape
         C = G.shape[0]
 
+        # Sanitizeaza NaN-urile inainte de orice calcul.
+        # Daca gradientii au explodat upstream, z sau G pot contine NaN,
+        # ceea ce ar face ca toate scorurile si loss-ul MI sa devina NaN.
+        # nan_to_num(0.0) trateaza NaN ca vector zero — discriminatorul
+        # va produce scoruri neutrale (aproape de 0) pentru aceste intrari,
+        # ceea ce este mai bine decat propagarea NaN prin tot modelul.
+        z = torch.nan_to_num(z, nan=0.0)
+        G = torch.nan_to_num(G, nan=0.0)
+
         # -----------------------------------------------------------------------
         # Bratul local (Eq. 1: sigma2(||z_i||_2) -> MLP)
         # Pas 1: L2-normalizare explicita conform ||z_i||_2 din Eq. 1

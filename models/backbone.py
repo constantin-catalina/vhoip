@@ -7,17 +7,12 @@ Implementarea backbone-ului 2G-GCN + ASSIGN conform paperurilor:
 
 Arhitectura (Fig. 2 ASSIGN + Fig. 3 2G-GCN):
 
-  Frame-level layer (ASSIGN §3.3):
-    1. FrameLevelBiRNN         — BiRNN per entitate, h^e_{t,f}  (Eq. 1)
-    2. FusionLevelGraph        — fuziune vizual + geometric  (2G-GCN Eq. 4)
-    3. SpatialMessagePassing   — mesaje intra/inter-class  (ASSIGN Eq. 2–4)
-    4. SegmentBoundaryDetector — MLP + Gumbel-Softmax, u^e_t  (ASSIGN Eq. 5)
-
-  Segment-level layer (ASSIGN §3.4):
-    5. SegmentLevelLayer       — BiRNN sparse + clasificare  (ASSIGN Eq. 6–10)
-
-  Geometric (2G-GCN §4):
-    6. GeometricLevelGCN       — GCN pe skeleton + bbox keypoints  (Eq. 1–3)
+  Frame-level layer (ASSIGN §3.3 + 2G-GCN §4):
+    1. GeometricLevelGCN      — GCN pe skeleton + bbox keypoints  (2G-GCN Eq. 1–3)
+    2. FusionLevelGraph       — fuziune raw ROI + geometric -> D  (2G-GCN Eq. 4)
+    3. FrameLevelBiRNN        — BiRNN pe features imbogatite, h^e_{t,f}  (ASSIGN Eq. 1)
+    4. SpatialMessagePassing  — mesaje intra/inter-class  (ASSIGN Eq. 2–4)
+    5. SegmentBoundaryDetector — MLP + Gumbel-Softmax, u^e_t  (ASSIGN Eq. 5)
 
 Training in doua stagii (ASSIGN §3.5):
   Stage 1: u^e_t := 1 everywhere (dense), L_Seg oprit
@@ -393,16 +388,20 @@ class SegmentLevelLayer(nn.Module):
             m_intra_s,    # (B, M, S, D)
         ], dim=-1)        # (B, M, S, 5D)
 
-        # Mascare sparse: zero la frame-urile cu u_hard=0 (skip)
-        z_sparse = z * u_hard.unsqueeze(-1)   # (B, M, S, 5D)
-
         # BiRNNs per entitate  (Eq. 9)
-        z_flat    = z_sparse.reshape(B * M, S, -1)
+        # IMPORTANT: BiRNN vede TOATE frame-urile (fara zero-masking).
+        # u_hard gateaza doar clasificatorul per frame (segment logits),
+        # nu inputul BiRNN — conform ASSIGN §3.4 care updateaza selectiv
+        # starea h_s, dar lasa BiRNN sa proceseze contextul complet.
+        z_flat = z.reshape(B * M, S, -1)
         h_s_flat, _ = self.birnn(z_flat)            # (B*M, S, D)
         h_s_flat    = self.dropout(h_s_flat)
         h_s         = h_s_flat.reshape(B, M, S, D)
 
         # Eq. 10: y^e_t = Softmax(sigma(h^e_{t,s}))
+        # Fiecare frame primeste propria clasificare din h_s calculat de BiRNN.
+        # u_hard NU suprima logit-urile la frame-urile de skip — BiRNN-ul
+        # a vazut deja contextul complet si produce h_s valide la fiecare t.
         segment_logits = self.classifier(F.relu(self.sigma(h_s)))   # (B, M, S, C)
 
         return h_s, segment_logits
@@ -454,7 +453,9 @@ class Backbone2GGCN(nn.Module):
 
         self.geo_gcn   = GeometricLevelGCN(geo_input_dim, C1, C2)
         self.frame_birnn = FrameLevelBiRNN(input_dim, hidden_dim, num_classes, num_layers, dropout)
-        self.fusion_graph = FusionLevelGraph(hidden_dim, C2, hidden_dim, dropout)
+        # FusionLevelGraph primeste ROI brut (input_dim=2048) si produce hidden_dim.
+        # Conform 2G-GCN Fig. 3: fusion se aplica INAINTE de BiRNN.
+        self.fusion_graph = FusionLevelGraph(input_dim, C2, hidden_dim, dropout)
         self.msg_passing  = SpatialMessagePassing()
 
         # Proiectia lui x^e_t la D (pentru concatenare cu h^e_{t,f} in detector)
@@ -505,23 +506,33 @@ class Backbone2GGCN(nn.Module):
                 dtype=torch.long, device=device,
             )
 
-        # ---- 1. Frame-level BiRNN  (Eq. 1) ----
-        x_bm = roi_features.permute(0, 2, 1, 3).reshape(B * M, S, D_in)
-        z_bm, fl_bm = self.frame_birnn(x_bm)
-        h_f         = z_bm.reshape(B, M, S, self.hidden_dim)    # (B, M, S, D)
-        fl_4d       = fl_bm.reshape(B, M, S, self.num_classes)  # frame logits 4D
-
-        # Z pentru VHOIP (primul nivel, inainte de fusion si segment)
-        z_intermediate = h_f   # (B, M, S, D)
-
-        # ---- 2. Geometric GCN + Fusion Graph per frame  (2G-GCN) ----
-        h_f_fused_list = []
+        # ---- 1. Geometric GCN + Fusion Graph pe raw ROI features  (2G-GCN Fig. 3) ----
+        # Ordinea corecta din paper: Geometric -> Fusion -> BiRNN.
+        # FusionLevelGraph proiecteaza visual_dim (2048) -> hidden_dim intern.
+        roi_bms = roi_features.permute(0, 2, 1, 3)   # (B, M, S, 2048)
+        x_fused_list = []
         for s in range(S):
             geo_out_s = self.geo_gcn(geo_features[:, s]) if geo_features is not None else None
-            h_f_fused_list.append(
-                self.fusion_graph(h_f[:, :, s, :], geo_out_s, entity_types)
+            x_fused_list.append(
+                self.fusion_graph(roi_bms[:, :, s, :], geo_out_s, entity_types)
             )
-        h_f_fused = torch.stack(h_f_fused_list, dim=2)   # (B, M, S, D)
+        x_fused = torch.stack(x_fused_list, dim=2)   # (B, M, S, D)
+
+        # ---- 2. Frame-level BiRNN pe features imbogatite  (ASSIGN §3.3, Eq. 1) ----
+        # Input este deja D-dim dupa fusion, deci sarim input_proj din FrameLevelBiRNN
+        # si folosim direct sub-modulele birnn + dropout + frame_classifier.
+        x_bm = x_fused.reshape(B * M, S, self.hidden_dim)
+        z_bm, _ = self.frame_birnn.birnn(x_bm)
+        z_bm     = self.frame_birnn.dropout(z_bm)
+        fl_bm    = self.frame_birnn.frame_classifier(z_bm)
+        h_f      = z_bm.reshape(B, M, S, self.hidden_dim)    # (B, M, S, D)
+        fl_4d    = fl_bm.reshape(B, M, S, self.num_classes)  # frame logits 4D
+
+        # Z pentru VHOIP (primul nivel BiRNN, dupa fusion geometric)
+        z_intermediate = h_f   # (B, M, S, D)
+
+        # h_f_fused = h_f (fusion deja aplicat la input BiRNN)
+        h_f_fused = h_f
 
         # ---- 3. Proiectia x^e_t  (pentru detector) ----
         x_proj_bms = self.x_proj(roi_features).permute(0, 2, 1, 3)   # (B, M, S, D)

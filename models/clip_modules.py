@@ -309,13 +309,40 @@ class IntegratedGlobalRepresentation(nn.Module):
         if not self._initialized:
             raise RuntimeError("Apeleaza initialize() cu G_init inainte de update().")
 
+        # Filtreaza features NaN inainte de prototyping.
+        # NaN-urile apar cand gradientii explodeaza si polueaza Z' colectat.
+        valid_mask = ~torch.isnan(collected_features).any(dim=-1)  # (N,)
+        if valid_mask.sum() == 0:
+            # Toate features sunt NaN — skip update complet, pastreaza G curent
+            print("  [WARN] EMA update sarit: toate features colectate sunt NaN.")
+            return
+        collected_features = collected_features[valid_mask]
+        labels = labels[valid_mask]
+
+        # Filtreaza si etichetele invalide (-1 = padding)
+        valid_labels = labels != -1
+        if valid_labels.sum() == 0:
+            return
+        collected_features = collected_features[valid_labels]
+        labels = labels[valid_labels]
+
         # Calculeaza V (prototipurile V-HOI din acest epoch)
         V = self.prototyping(collected_features, labels)   # (C, feature_dim)
 
         if epoch >= self.warmup_epochs - 1:
             # EMA update: G = rho*G + (1-rho)*V
-            self.G = self.rho * self.G + (1 - self.rho) * V
-            self.G = F.normalize(self.G, dim=-1)   # re-normalizare
+            # Actualizeaza DOAR clasele care au avut sample-uri in acest epoch.
+            # Clasele fara sample-uri au prototip zero dupa F.normalize -> NaN.
+            # Le pastram pe cele din G-ul precedent.
+            has_samples = (V.norm(dim=-1) > 1e-6)  # (C,) — clase cu date reale
+
+            new_G = self.rho * self.G + (1 - self.rho) * V
+            self.G = torch.where(has_samples.unsqueeze(-1), new_G, self.G)
+
+            # Re-normalizeaza doar randurile actualizate (cele cu has_samples)
+            # pentru a nu disturba randurile neactualizate
+            norms = self.G.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+            self.G = self.G / norms
 
     def get_G(self) -> torch.Tensor:
         """Returneaza G curent (C, feature_dim)."""

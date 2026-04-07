@@ -10,14 +10,14 @@ model:
 training:
   epochs: 50
   batch_size: 4                  # mic pentru GPU 4-8GB
-  learning_rate: 5.0e-5
-  weight_decay: 1.0e-4
+  learning_rate: 1.0e-3
   warmup_epochs: 5               # epoci fara EMA update
 
   # Coeficienti loss (Eq. 4 din paper)
   lambda1: 1.0                   # L_Seg
   lambda2: 0.5                   # L_MI
   lambda3: 0.5                   # L_Cos
+  lambda_ant: 1.0                # L_Anticipation (ASSIGN Appendix B)
 
   # EMA
   rho: 0.9                       # G = rho*G + (1-rho)*V
