@@ -23,7 +23,7 @@ training:
   rho: 0.9                       # G = rho*G + (1-rho)*V
 
   # Mixed precision (economiseste VRAM)
-  use_amp: true
+  use_amp: false
 
   # Gradient clipping (stabilitate)
   grad_clip: 0.5
