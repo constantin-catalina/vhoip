@@ -29,7 +29,6 @@ def save_checkpoint(
     metrics: dict,
     checkpoint_dir: str,
     is_best: bool = False,
-    filename: Optional[str] = None,
     save_local: bool = True,
 ) -> dict:
     state = build_checkpoint_state(model, optimizer, epoch, metrics)
@@ -39,19 +38,15 @@ def save_checkpoint(
 
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-    fname = filename or f"epoch_{epoch:03d}.pth"
-    path = os.path.join(checkpoint_dir, fname)
-    torch.save(state, path)
+    saved = {"checkpoint": None, "best_checkpoint": None, "state": state}
 
-    saved = {"checkpoint": path, "best_checkpoint": None, "state": state}
-
+    # Only save best_model.pth — skip epoch_XXX.pth to save disk space
     if is_best:
         best_path = os.path.join(checkpoint_dir, "best_model.pth")
         torch.save(state, best_path)
         saved["best_checkpoint"] = best_path
         print(f"  --> Salvat best model (FSUM={metrics.get('fsum', 0):.1f})")
 
-    print(f"  --> Checkpoint salvat: {path}")
     return saved
 
 

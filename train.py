@@ -10,7 +10,6 @@ Utilizare:
 
 import argparse
 import os
-import tempfile
 import torch
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
@@ -383,7 +382,7 @@ def main():
         is_best = metrics["fsum"] > best_fsum
         if is_best:
             best_fsum = metrics["fsum"]
-            saved = save_checkpoint(
+            save_checkpoint(
                 model,
                 optimizer,
                 epoch,
@@ -393,30 +392,6 @@ def main():
                 save_local=local_checkpoints_enabled,
             )
 
-            # W&B-only mode: dump a temporary checkpoint file for artifact upload.
-            temp_ckpt_path = None
-            temp_best_path = None
-            if not local_checkpoints_enabled and use_wandb:
-                fd, temp_ckpt_path = tempfile.mkstemp(prefix=f"{experiment_name}_ep{epoch:03d}_", suffix=".pth")
-                os.close(fd)
-                torch.save(saved["state"], temp_ckpt_path)
-
-                fd2, temp_best_path = tempfile.mkstemp(prefix=f"{experiment_name}_best_ep{epoch:03d}_", suffix=".pth")
-                os.close(fd2)
-                torch.save(saved["state"], temp_best_path)
-
-            logger.log_checkpoint_artifact(
-                checkpoint_path=temp_ckpt_path or saved["checkpoint"],
-                best_checkpoint_path=temp_best_path or saved.get("best_checkpoint"),
-                epoch=epoch,
-                metrics=metrics,
-                is_best=True,
-            )
-
-            if temp_ckpt_path and os.path.exists(temp_ckpt_path):
-                os.remove(temp_ckpt_path)
-            if temp_best_path and os.path.exists(temp_best_path):
-                os.remove(temp_best_path)
 
     logger.info(f"\nAntrenare finalizata. Best FSUM: {best_fsum:.1f}")
     logger.log_summary({"best_fsum": best_fsum, "fold": args.fold})
