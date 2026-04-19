@@ -151,24 +151,49 @@ class CLIPTextEncoder(nn.Module):
         template: str = "A photo of a {subject} {verb}",
     ) -> torch.Tensor:
         """
-        Genereaza reprezentarile textuale T pentru toate clasele.
-
-        Args:
-            label_names: lista de verbe/activitati (ex: ["eating", "drinking"])
-            subject: subiectul din template (person/hand/object)
-            template: template-ul de formatare
-
-        Returns:
-            T: (C, 512) - reprezentari textuale L2 normalizate, una per clasa
+        C6 — Multi-Template Prompt Ensembling.
+        
+        Accepts either a single template string or a list of templates.
+        When multiple templates are given, encodes all of them and averages
+        the resulting embeddings before L2-normalizing — this is the static
+        ensemble that forms the T representation used in L_Cos.
+        
+        Single template (baseline behaviour):
+            template = "A photo of a {subject} {verb}"
+        Multi-template (C6):
+            template = [
+                "A photo of a {subject} {verb}",
+                "A {subject} is {verb}",
+                "The {subject} performs the action of {verb}",
+            ]
         """
-        texts = [
-            template.format(subject=subject, verb=label)
-            for label in label_names
-        ]
+        # Normalise to list so the rest of the code is uniform
+        if isinstance(template, str):
+            templates = [template]
+        else:
+            templates = list(template)
 
-        tokens = clip.tokenize(texts).to(self.device)
-        text_features = self.text_encoder.encode_text(tokens)  # (C, 512)
-        return F.normalize(text_features.float(), dim=-1)
+        all_features = []  # will be (num_templates, C, 512)
+
+        for tmpl in templates:
+            texts = [
+                tmpl.format(subject=subject, verb=label)
+                for label in label_names
+            ]
+            tokens = clip.tokenize(texts).to(self.device)
+            feats = self.text_encoder.encode_text(tokens)   # (C, 512)
+            feats = F.normalize(feats.float(), dim=-1)
+            all_features.append(feats)
+
+        if len(all_features) == 1:
+            # Baseline path — no change in behaviour
+            return all_features[0]
+
+        # Stack -> (num_templates, C, 512), mean over templates -> (C, 512)
+        stacked = torch.stack(all_features, dim=0)
+        T = stacked.mean(dim=0)
+        # Re-normalise after averaging (the mean of unit vectors is not unit)
+        return F.normalize(T, dim=-1)
 
 
 # ---------------------------------------------------------------------------

@@ -12,7 +12,13 @@ dataset:
   cross_validation: "two_subject_out"   # 2 subiecti in test
 
   clip_subject: "person"
-  clip_template: "A photo of a person {verb}"
+  clip_template: 
+    - "A photo of a {subject} {verb}"
+    - "A {subject} is {verb}"
+    - "The {subject} performs {verb}"
+    - "An image showing a {subject} {verb}"
+    - "A {subject} engaged in {verb}"
+
 
 model:
   num_classes: 13
@@ -32,6 +38,6 @@ training:
 logging:
   wandb_enabled: true
   wandb_project: "vhoip"
-  wandb_run_name: "{dataset}_v2_fold{fold}"
+  wandb_run_name: "{dataset}_c6_fold{fold}"
   local_logging_enabled: false    # no TensorBoard files
   local_checkpoints_enabled: true
