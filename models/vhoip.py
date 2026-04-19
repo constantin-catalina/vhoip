@@ -137,16 +137,22 @@ class VHOIP(nn.Module):
         self,
         label_names: List[str],
         subject: str,
-        template: str,
+        template,   # str or ListConfig/list
     ) -> torch.Tensor:
         """Precomputa T la initializare (frozen, nu se recalculeaza in training)."""
+        # OmegaConf returns ListConfig when template is a YAML list — convert to plain list
+        from omegaconf import ListConfig
+        if isinstance(template, ListConfig):
+            template = list(template)
+
         with torch.no_grad():
             T = self.text_encoder.encode_labels(
                 label_names,
                 subject=subject,
                 template=template,
             )
-        print(f"  Text features T precomputed: {T.shape}")
+        num_templates = len(template) if isinstance(template, list) else 1
+        print(f"  Text features T precomputed: {T.shape} ({num_templates} template(s) ensembled)")
         return T
 
     def initialize_G(self, clip_visual_features: torch.Tensor, labels: torch.Tensor) -> None:
