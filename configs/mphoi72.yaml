@@ -12,13 +12,11 @@ dataset:
   cross_validation: "two_subject_out"   # 2 subiecti in test
 
   clip_subject: "person"
-  clip_template: 
-    - "A photo of a {subject} {verb}"
-    - "A {subject} is {verb}"
-    - "The {subject} performs {verb}"
-    - "An image showing a {subject} {verb}"
-    - "A {subject} engaged in {verb}"
-
+  clip_template:
+  - "A photo of a {subject} {verb}"
+  - "A {subject} {verb} with their hands and arms"
+  - "Two people where one is {verb}"
+  - "A scene where a person is {verb} an object"
 
 model:
   num_classes: 13
