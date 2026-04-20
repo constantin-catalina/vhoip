@@ -1,0 +1,11 @@
+defaults:
+  - base
+  - mphoi72
+
+model:
+  use_learnable_prompts: true
+  prompt_n_ctx: 16
+  prompt_ctx_init: "a photo of a person"
+
+logging:
+  wandb_run_name: "{dataset}_c6b_fold{fold}"

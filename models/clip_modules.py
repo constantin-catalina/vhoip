@@ -119,6 +119,96 @@ class CLIPVisualEncoder(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Learnable Prompt Encoder (CoOp-style, C6b)
+# ---------------------------------------------------------------------------
+
+class LearnablePromptEncoder(nn.Module):
+    """
+    C6b — Learnable Prompt Context Tokens (CoOp-style).
+
+    Adds n_ctx learnable context vectors prepended to the class token
+    embeddings inside CLIP's text encoder. CLIP stays completely frozen.
+    Only the context vectors are trained.
+
+    Architecture:
+        Input per class: [SOS] [ctx_1] ... [ctx_n] [class_token] [EOS]
+        vs original:     [SOS] [template_tokens...] [class_token] [EOS]
+
+    Reference: Zhou et al., "Learning to Prompt for Vision-Language Models"
+               (CoOp), IJCV 2022. Adapted for V-HOI recognition.
+    """
+
+    def __init__(
+        self,
+        clip_model,
+        n_ctx: int = 16,
+        ctx_init: str = "a photo of a person",
+        clip_dim: int = 512,
+        device: str = "cuda",
+    ):
+        super().__init__()
+        self.device = device
+        self.n_ctx = n_ctx
+        self.clip_model = clip_model  # frozen
+        self.dtype = clip_model.dtype
+
+        if ctx_init:
+            ctx_init_tokens = clip.tokenize(ctx_init).to(device)
+            with torch.no_grad():
+                init_embeddings = clip_model.token_embedding(ctx_init_tokens)
+                init_ctx = init_embeddings[0, 1:n_ctx+1, :]  # (n_ctx, clip_dim)
+            self.ctx = nn.Parameter(init_ctx.float())
+        else:
+            ctx_vectors = torch.empty(n_ctx, clip_dim)
+            nn.init.normal_(ctx_vectors, std=0.02)
+            self.ctx = nn.Parameter(ctx_vectors)
+
+        for param in self.clip_model.parameters():
+            param.requires_grad = False
+
+    def forward(self, label_names: List[str], subject: str = "person") -> torch.Tensor:
+        """
+        Encode class names with learnable context prepended.
+
+        Returns:
+            T: (C, clip_dim) L2-normalized text features
+        """
+        class_texts = [f"{subject} {label}" for label in label_names]
+
+        with torch.no_grad():
+            tokens = clip.tokenize(class_texts).to(self.device)
+            token_embeddings = self.clip_model.token_embedding(tokens)
+            # token_embeddings: (C, seq_len, clip_dim)
+
+        C, seq_len, _ = token_embeddings.shape
+
+        sos = token_embeddings[:, :1, :]                        # (C, 1, D)
+        ctx = self.ctx.unsqueeze(0).expand(C, -1, -1)          # (C, n_ctx, D)
+        ctx = ctx.to(token_embeddings.dtype)
+
+        class_token_start = 1
+        class_token_end = seq_len - self.n_ctx - 1
+        class_token_end = max(class_token_end, class_token_start + 1)
+
+        class_tokens = token_embeddings[:, class_token_start:class_token_end, :]
+        suffix = token_embeddings[:, class_token_end:, :]
+
+        composed = torch.cat([sos, ctx, class_tokens, suffix], dim=1)
+        composed = composed[:, :seq_len, :]                     # (C, seq_len, D)
+
+        x = composed + self.clip_model.positional_embedding.type(self.dtype)
+        x = x.permute(1, 0, 2)                                 # (seq_len, C, D)
+        x = self.clip_model.transformer(x)
+        x = x.permute(1, 0, 2)                                 # (C, seq_len, D)
+        x = self.clip_model.ln_final(x).type(self.dtype)
+
+        T = x[torch.arange(C), tokens.argmax(dim=-1)]          # (C, D)
+        T = T @ self.clip_model.text_projection                 # (C, clip_dim)
+
+        return F.normalize(T.float(), dim=-1)                   # (C, clip_dim)
+
+
+# ---------------------------------------------------------------------------
 # CLIP Text Encoder (frozen)
 # ---------------------------------------------------------------------------
 
@@ -132,9 +222,17 @@ class CLIPTextEncoder(nn.Module):
         "A photo of a hand sawing"
     """
 
-    def __init__(self, model_name: str = "ViT-B/16", device: str = "cuda"):
+    def __init__(
+        self,
+        model_name: str = "ViT-B/16",
+        device: str = "cuda",
+        use_learnable_prompts: bool = False,
+        n_ctx: int = 16,
+        ctx_init: str = "a photo of a person",
+    ):
         super().__init__()
         self.device = device
+        self.use_learnable_prompts = use_learnable_prompts
 
         clip_model, _ = clip.load(model_name, device=device)
         self.text_encoder = clip_model
@@ -143,7 +241,19 @@ class CLIPTextEncoder(nn.Module):
         for param in self.text_encoder.parameters():
             param.requires_grad = False
 
-    @torch.no_grad()
+        if use_learnable_prompts:
+            self.prompt_encoder = LearnablePromptEncoder(
+                clip_model=self.text_encoder,
+                n_ctx=n_ctx,
+                ctx_init=ctx_init,
+                clip_dim=self.feature_dim,
+                device=device,
+            )
+            print(f"  C6b: LearnablePromptEncoder initialized "
+                  f"(n_ctx={n_ctx}, ctx_init='{ctx_init}')")
+        else:
+            self.prompt_encoder = None
+
     def encode_labels(
         self,
         label_names: List[str],
@@ -152,12 +262,12 @@ class CLIPTextEncoder(nn.Module):
     ) -> torch.Tensor:
         """
         C6 — Multi-Template Prompt Ensembling.
-        
+
         Accepts either a single template string or a list of templates.
         When multiple templates are given, encodes all of them and averages
         the resulting embeddings before L2-normalizing — this is the static
         ensemble that forms the T representation used in L_Cos.
-        
+
         Single template (baseline behaviour):
             template = "A photo of a {subject} {verb}"
         Multi-template (C6):
@@ -167,33 +277,35 @@ class CLIPTextEncoder(nn.Module):
                 "The {subject} performs the action of {verb}",
             ]
         """
-        # Normalise to list so the rest of the code is uniform
-        if isinstance(template, str):
-            templates = [template]
-        else:
-            templates = list(template)
+        if self.prompt_encoder is not None:
+            # C6b path — gradient flows through learnable ctx only
+            return self.prompt_encoder(label_names, subject=subject)
 
-        all_features = []  # will be (num_templates, C, 512)
+        # Original C6 / baseline path (no grad needed)
+        with torch.no_grad():
+            if isinstance(template, str):
+                templates = [template]
+            else:
+                templates = list(template)
 
-        for tmpl in templates:
-            texts = [
-                tmpl.format(subject=subject, verb=label)
-                for label in label_names
-            ]
-            tokens = clip.tokenize(texts).to(self.device)
-            feats = self.text_encoder.encode_text(tokens)   # (C, 512)
-            feats = F.normalize(feats.float(), dim=-1)
-            all_features.append(feats)
+            all_features = []
 
-        if len(all_features) == 1:
-            # Baseline path — no change in behaviour
-            return all_features[0]
+            for tmpl in templates:
+                texts = [
+                    tmpl.format(subject=subject, verb=label)
+                    for label in label_names
+                ]
+                tokens = clip.tokenize(texts).to(self.device)
+                feats = self.text_encoder.encode_text(tokens)   # (C, 512)
+                feats = F.normalize(feats.float(), dim=-1)
+                all_features.append(feats)
 
-        # Stack -> (num_templates, C, 512), mean over templates -> (C, 512)
-        stacked = torch.stack(all_features, dim=0)
-        T = stacked.mean(dim=0)
-        # Re-normalise after averaging (the mean of unit vectors is not unit)
-        return F.normalize(T, dim=-1)
+            if len(all_features) == 1:
+                return all_features[0]
+
+            stacked = torch.stack(all_features, dim=0)
+            T = stacked.mean(dim=0)
+            return F.normalize(T, dim=-1)
 
 
 # ---------------------------------------------------------------------------
