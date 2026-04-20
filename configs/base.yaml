@@ -4,6 +4,9 @@ model:
   hidden_dim: 256                # dimensiune ascunsa BiRNN
   num_layers: 2                  # straturi BiRNN
   dropout: 0.3
+  use_learnable_prompts: false   # set true for C6b (CoOp-style learnable context)
+  prompt_n_ctx: 16               # number of learnable context tokens
+  prompt_ctx_init: "a photo of a person"  # initialization string for context vectors
 
 training:
   epochs: 50

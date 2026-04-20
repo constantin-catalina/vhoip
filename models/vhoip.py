@@ -95,11 +95,14 @@ class VHOIP(nn.Module):
         )
 
         # -----------------------------------------------------------------------
-        # CLIP Text Encoder (frozen)  (VHOIP §3.4)
+        # CLIP Text Encoder (frozen, or with learnable prompts for C6b)
         # -----------------------------------------------------------------------
         self.text_encoder = CLIPTextEncoder(
             model_name=cfg.model.clip_model,
             device=device,
+            use_learnable_prompts=getattr(cfg.model, "use_learnable_prompts", False),
+            n_ctx=getattr(cfg.model, "prompt_n_ctx", 16),
+            ctx_init=getattr(cfg.model, "prompt_ctx_init", "a photo of a person"),
         )
 
         # -----------------------------------------------------------------------
@@ -116,15 +119,25 @@ class VHOIP(nn.Module):
         # Colector features Z' pentru EMA update la sfarsitul epoch-ului
         self.collector = FeaturesCollector()
 
-        # Precomputa reprezentarile textuale T (o singura data, frozen)
-        self.register_buffer(
-            "T",
-            self._compute_text_features(
-                label_names,
-                subject=cfg.dataset.clip_subject,
-                template=cfg.dataset.clip_template,
-            ),
-        )
+        # Store label info needed to recompute T dynamically in C6b
+        self.use_learnable_prompts = getattr(cfg.model, "use_learnable_prompts", False)
+        self._label_names = label_names
+        self._clip_subject = cfg.dataset.clip_subject
+        self._clip_template = cfg.dataset.clip_template
+
+        if self.use_learnable_prompts:
+            # T is recomputed each forward pass — register placeholder for state_dict
+            self.register_buffer("T", torch.zeros(cfg.model.num_classes, cfg.model.clip_dim))
+            print("  C6b: T will be recomputed dynamically during training")
+        else:
+            self.register_buffer(
+                "T",
+                self._compute_text_features(
+                    label_names,
+                    subject=cfg.dataset.clip_subject,
+                    template=cfg.dataset.clip_template,
+                ),
+            )
 
         # Flag pentru modul inference
         self._inference_mode = False
@@ -259,7 +272,15 @@ class VHOIP(nn.Module):
         # T: (C, clip_dim), z_prime: (B, N, clip_dim)
         # cos_similarities: (B, N, C)
         # -----------------------------------------------------------------------
-        cos_similarities = torch.einsum("bnd,cd->bnc", z_prime, self.T)
+        if self.use_learnable_prompts:
+            # C6b: recompute T each step so gradients flow through ctx vectors
+            T = self.text_encoder.encode_labels(
+                self._label_names,
+                subject=self._clip_subject,
+            )
+        else:
+            T = self.T  # frozen buffer, computed once at init
+        cos_similarities = torch.einsum("bnd,cd->bnc", z_prime, T)
 
         # -----------------------------------------------------------------------
         # Colecteaza Z' pentru EMA update la sfarsitul epoch-ului (Alg. 1)
