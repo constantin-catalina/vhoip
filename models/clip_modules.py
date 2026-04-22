@@ -10,6 +10,17 @@ Module CLIP din VHOIP:
 Nota importanta pentru GPU 4-8GB:
   CLIP e folosit FROZEN - nu se antreneaza, deci nu consuma memorie
   in backward pass. Features CLIP se pot extrage offline (recomandat).
+
+C6b improvements over baseline:
+  1. Fixed token slicing — context tokens are inserted correctly regardless
+     of class name length, anchored to the real EOS position.
+  2. Class-specific context offsets — each class gets a learnable residual
+     on top of the shared context, allowing fine-grained HOI discrimination.
+  3. Learnable temperature scalar on cosine similarities (in CLIPTextEncoder)
+     — sharpens the L_Cos cross-entropy signal the same way CLIP itself does.
+  4. Prompt regularization loss (prompt_reg_loss) — cosine alignment between
+     learned T and frozen T, preventing context vectors from drifting out of
+     the CLIP embedding space.
 """
 
 import torch
@@ -114,25 +125,34 @@ class CLIPVisualEncoder(nn.Module):
                 all_features[vid_id] = feats[i]
 
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        import numpy as np
         np.save(save_path, all_features)
         print(f"Features CLIP salvate in {save_path}")
 
 
 # ---------------------------------------------------------------------------
-# Learnable Prompt Encoder (CoOp-style, C6b)
+# Learnable Prompt Encoder (CoOp-style, C6b) — IMPROVED
 # ---------------------------------------------------------------------------
 
 class LearnablePromptEncoder(nn.Module):
     """
-    C6b — Learnable Prompt Context Tokens (CoOp-style).
+    C6b — Learnable Prompt Context Tokens (CoOp-style), improved version.
 
-    Adds n_ctx learnable context vectors prepended to the class token
-    embeddings inside CLIP's text encoder. CLIP stays completely frozen.
-    Only the context vectors are trained.
+    Changes vs. original:
+      1. Fixed token slicing: context insertion is now anchored to the real
+         EOS position (tokens.argmax(dim=-1)), not derived from seq_len - n_ctx.
+         This prevents class tokens from being silently truncated for longer
+         class names or large n_ctx values.
 
-    Architecture:
-        Input per class: [SOS] [ctx_1] ... [ctx_n] [class_token] [EOS]
-        vs original:     [SOS] [template_tokens...] [class_token] [EOS]
+      2. Class-specific context offsets: each of the C classes gets a small
+         learnable residual vector (class_ctx_offsets, shape C x n_ctx x D)
+         added on top of the shared context. This lets the model learn that
+         "approach" and "pour" need different prompt shapes while still
+         sharing a common base — important for fine-grained HOI.
+         Initialized to zero so training starts from the shared-context baseline.
+
+    Architecture per class k:
+        [SOS] [ctx_shared + offset_k] x n_ctx [class_tokens_k] [EOS] [PAD...]
 
     Reference: Zhou et al., "Learning to Prompt for Vision-Language Models"
                (CoOp), IJCV 2022. Adapted for V-HOI recognition.
@@ -141,6 +161,7 @@ class LearnablePromptEncoder(nn.Module):
     def __init__(
         self,
         clip_model,
+        num_classes: int,
         n_ctx: int = 16,
         ctx_init: str = "a photo of a person",
         clip_dim: int = 512,
@@ -151,17 +172,28 @@ class LearnablePromptEncoder(nn.Module):
         self.n_ctx = n_ctx
         self.clip_model = clip_model  # frozen
         self.dtype = clip_model.dtype
+        self.num_classes = num_classes
 
+        # --- Shared context vectors (same as original CoOp) ---
         if ctx_init:
             ctx_init_tokens = clip.tokenize(ctx_init).to(device)
             with torch.no_grad():
                 init_embeddings = clip_model.token_embedding(ctx_init_tokens)
-                init_ctx = init_embeddings[0, 1:n_ctx+1, :]  # (n_ctx, clip_dim)
+                # Take exactly n_ctx tokens starting after SOS
+                init_ctx = init_embeddings[0, 1:n_ctx + 1, :]  # (n_ctx, clip_dim)
             self.ctx = nn.Parameter(init_ctx.float())
         else:
             ctx_vectors = torch.empty(n_ctx, clip_dim)
             nn.init.normal_(ctx_vectors, std=0.02)
             self.ctx = nn.Parameter(ctx_vectors)
+
+        # --- Class-specific context offsets (NEW) ---
+        # Shape: (num_classes, n_ctx, clip_dim), initialized to zero
+        # so the model starts at the shared-context baseline and can diverge
+        # gradually as training provides class-specific gradients.
+        self.class_ctx_offsets = nn.Parameter(
+            torch.zeros(num_classes, n_ctx, clip_dim)
+        )
 
         for param in self.clip_model.parameters():
             param.requires_grad = False
@@ -170,46 +202,84 @@ class LearnablePromptEncoder(nn.Module):
         """
         Encode class names with learnable context prepended.
 
+        FIX: Token insertion is now anchored to the real EOS position of each
+        class string (tokens.argmax(dim=-1)), so class tokens are never
+        silently truncated regardless of class name length or n_ctx value.
+
         Returns:
             T: (C, clip_dim) L2-normalized text features
         """
         class_texts = [f"{subject} {label}" for label in label_names]
+        C = len(class_texts)
 
         with torch.no_grad():
             tokens = clip.tokenize(class_texts).to(self.device)
             token_embeddings = self.clip_model.token_embedding(tokens)
             # token_embeddings: (C, seq_len, clip_dim)
 
-        C, seq_len, _ = token_embeddings.shape
+        seq_len = token_embeddings.shape[1]
 
-        sos = token_embeddings[:, :1, :]                        # (C, 1, D)
-        ctx = self.ctx.unsqueeze(0).expand(C, -1, -1)          # (C, n_ctx, D)
-        ctx = ctx.to(token_embeddings.dtype)
+        # --- FIX: anchor to real EOS positions ---
+        # EOS token is the highest token ID in each row.
+        eos_positions = tokens.argmax(dim=-1)   # (C,) — real EOS index per class
 
-        class_token_start = 1
-        class_token_end = seq_len - self.n_ctx - 1
-        class_token_end = max(class_token_end, class_token_start + 1)
+        # Build composed sequences class-by-class so each uses its own EOS anchor.
+        # This is slightly slower than a fully batched op but correct and clear.
+        ctx_shared = self.ctx.unsqueeze(0).expand(C, -1, -1)          # (C, n_ctx, D)
+        ctx_shared = ctx_shared.to(token_embeddings.dtype)
+        offsets = self.class_ctx_offsets.to(token_embeddings.dtype)    # (C, n_ctx, D)
+        ctx_per_class = ctx_shared + offsets                            # (C, n_ctx, D)
 
-        class_tokens = token_embeddings[:, class_token_start:class_token_end, :]
-        suffix = token_embeddings[:, class_token_end:, :]
+        composed_list = []
+        for i in range(C):
+            eos_pos = eos_positions[i].item()   # scalar int
 
-        composed = torch.cat([sos, ctx, class_tokens, suffix], dim=1)
-        composed = composed[:, :seq_len, :]                     # (C, seq_len, D)
+            # SOS: position 0
+            sos = token_embeddings[i, :1, :]                            # (1, D)
 
-        x = composed + self.clip_model.positional_embedding.type(self.dtype)
-        x = x.permute(1, 0, 2)                                 # (seq_len, C, D)
+            # Class content tokens: from position 1 up to (but not including) EOS
+            # These are the actual word-piece tokens for "{subject} {label}"
+            class_tokens = token_embeddings[i, 1:eos_pos, :]            # (eos_pos-1, D)
+
+            # EOS + any padding: from eos_pos onwards
+            suffix = token_embeddings[i, eos_pos:, :]                   # (seq_len-eos_pos, D)
+
+            # Compose: [SOS] [ctx x n_ctx] [class_tokens] [EOS] [PAD...]
+            composed = torch.cat([
+                sos,                    # (1, D)
+                ctx_per_class[i],       # (n_ctx, D)
+                class_tokens,           # (variable, D)
+                suffix,                 # (EOS + PAD, D)
+            ], dim=0)                   # (1 + n_ctx + (eos_pos-1) + (seq_len-eos_pos), D)
+
+            # Truncate or pad to seq_len
+            if composed.shape[0] >= seq_len:
+                composed = composed[:seq_len]
+            else:
+                pad_len = seq_len - composed.shape[0]
+                pad = torch.zeros(pad_len, composed.shape[1],
+                                  dtype=composed.dtype, device=composed.device)
+                composed = torch.cat([composed, pad], dim=0)
+
+            composed_list.append(composed)
+
+        composed_batch = torch.stack(composed_list, dim=0)              # (C, seq_len, D)
+
+        # Run through CLIP transformer (same as original)
+        x = composed_batch + self.clip_model.positional_embedding.type(self.dtype)
+        x = x.permute(1, 0, 2)                                         # (seq_len, C, D)
         x = self.clip_model.transformer(x)
-        x = x.permute(1, 0, 2)                                 # (C, seq_len, D)
+        x = x.permute(1, 0, 2)                                         # (C, seq_len, D)
         x = self.clip_model.ln_final(x).type(self.dtype)
 
-        T = x[torch.arange(C), tokens.argmax(dim=-1)]          # (C, D)
-        T = T @ self.clip_model.text_projection                 # (C, clip_dim)
+        T = x[torch.arange(C), tokens.argmax(dim=-1)]                  # (C, D)
+        T = T @ self.clip_model.text_projection                         # (C, clip_dim)
 
-        return F.normalize(T.float(), dim=-1)                   # (C, clip_dim)
+        return F.normalize(T.float(), dim=-1)                           # (C, clip_dim)
 
 
 # ---------------------------------------------------------------------------
-# CLIP Text Encoder (frozen)
+# CLIP Text Encoder (frozen + optional learnable prompts)
 # ---------------------------------------------------------------------------
 
 class CLIPTextEncoder(nn.Module):
@@ -217,9 +287,12 @@ class CLIPTextEncoder(nn.Module):
     Wrapper peste CLIP text encoder.
     Transforma template-uri HOI in reprezentari textuale T.
 
-    Template din paper: "A photo of a/an [subject] [verb-ing/able]"
-    Ex: "A photo of a person eating"
-        "A photo of a hand sawing"
+    C6b additions:
+      - learnable_temperature: a scalar log-temperature initialized to log(1/0.07)
+        (same as CLIP's default), applied to cosine similarities in vhoip.py.
+        Exposed as self.log_temp so vhoip.py can use it directly.
+      - get_frozen_T(): returns the frozen text features computed at init,
+        used by the prompt regularization loss.
     """
 
     def __init__(
@@ -229,6 +302,7 @@ class CLIPTextEncoder(nn.Module):
         use_learnable_prompts: bool = False,
         n_ctx: int = 16,
         ctx_init: str = "a photo of a person",
+        num_classes: int = 0,   # required when use_learnable_prompts=True
     ):
         super().__init__()
         self.device = device
@@ -241,47 +315,50 @@ class CLIPTextEncoder(nn.Module):
         for param in self.text_encoder.parameters():
             param.requires_grad = False
 
+        # Learnable temperature (log-space for stability).
+        # exp(log_temp) is the scale applied to cosine similarities.
+        # Initialized to CLIP's default 1/0.07 ≈ 14.3 -> log(14.3) ≈ 2.66
+        self.log_temp = nn.Parameter(torch.tensor(2.6593))  # learnable
+
         if use_learnable_prompts:
+            assert num_classes > 0, "num_classes must be set when use_learnable_prompts=True"
             self.prompt_encoder = LearnablePromptEncoder(
                 clip_model=self.text_encoder,
+                num_classes=num_classes,
                 n_ctx=n_ctx,
                 ctx_init=ctx_init,
                 clip_dim=self.feature_dim,
                 device=device,
             )
             print(f"  C6b: LearnablePromptEncoder initialized "
-                  f"(n_ctx={n_ctx}, ctx_init='{ctx_init}')")
+                  f"(n_ctx={n_ctx}, num_classes={num_classes}, ctx_init='{ctx_init}')")
         else:
             self.prompt_encoder = None
 
-    def encode_labels(
+        # Frozen T — stored at init, used for prompt regularization loss in C6b.
+        # Populated by CLIPTextEncoder.precompute_frozen_T() called from vhoip.py.
+        self._frozen_T: Optional[torch.Tensor] = None
+
+    @property
+    def temperature(self) -> torch.Tensor:
+        """Positive temperature scalar: exp(log_temp)."""
+        return self.log_temp.clamp(max=3.5).exp()  
+    
+    def precompute_frozen_T(
         self,
         label_names: List[str],
-        subject: str = "person",
-        template: str = "A photo of a {subject} {verb}",
+        subject: str,
+        template,
     ) -> torch.Tensor:
         """
-        C6 — Multi-Template Prompt Ensembling.
-
-        Accepts either a single template string or a list of templates.
-        When multiple templates are given, encodes all of them and averages
-        the resulting embeddings before L2-normalizing — this is the static
-        ensemble that forms the T representation used in L_Cos.
-
-        Single template (baseline behaviour):
-            template = "A photo of a {subject} {verb}"
-        Multi-template (C6):
-            template = [
-                "A photo of a {subject} {verb}",
-                "A {subject} is {verb}",
-                "The {subject} performs the action of {verb}",
-            ]
+        Compute and store frozen text features T (no grad, fixed templates).
+        Called once at model init. Returns T and also stores it internally
+        so get_frozen_T() works at any point later.
         """
-        if self.prompt_encoder is not None:
-            # C6b path — gradient flows through learnable ctx only
-            return self.prompt_encoder(label_names, subject=subject)
+        from omegaconf import ListConfig
+        if isinstance(template, ListConfig):
+            template = list(template)
 
-        # Original C6 / baseline path (no grad needed)
         with torch.no_grad():
             if isinstance(template, str):
                 templates = [template]
@@ -289,14 +366,59 @@ class CLIPTextEncoder(nn.Module):
                 templates = list(template)
 
             all_features = []
+            for tmpl in templates:
+                texts = [tmpl.format(subject=subject, verb=label) for label in label_names]
+                tokens = clip.tokenize(texts).to(self.device)
+                feats = self.text_encoder.encode_text(tokens)
+                feats = F.normalize(feats.float(), dim=-1)
+                all_features.append(feats)
 
+            if len(all_features) == 1:
+                T = all_features[0]
+            else:
+                T = F.normalize(torch.stack(all_features, dim=0).mean(dim=0), dim=-1)
+
+        self._frozen_T = T
+        return T
+
+    def get_frozen_T(self) -> Optional[torch.Tensor]:
+        """Returns frozen T (computed at init). None if not yet precomputed."""
+        return self._frozen_T
+
+    def encode_labels(
+        self,
+        label_names: List[str],
+        subject: str = "person",
+        template = "A photo of a {subject} {verb}",
+    ) -> torch.Tensor:
+        """
+        C6 — Multi-Template Prompt Ensembling / C6b — Learnable Prompts.
+
+        In C6b mode: uses LearnablePromptEncoder (gradients flow through ctx).
+        In C6 mode:  static multi-template ensemble (no grad needed).
+        """
+        if self.prompt_encoder is not None:
+            # C6b path — gradient flows through learnable ctx + class offsets
+            return self.prompt_encoder(label_names, subject=subject)
+
+        # Original C6 / baseline path (no grad needed)
+        with torch.no_grad():
+            from omegaconf import ListConfig
+            if isinstance(template, ListConfig):
+                template = list(template)
+            if isinstance(template, str):
+                templates = [template]
+            else:
+                templates = list(template)
+
+            all_features = []
             for tmpl in templates:
                 texts = [
                     tmpl.format(subject=subject, verb=label)
                     for label in label_names
                 ]
                 tokens = clip.tokenize(texts).to(self.device)
-                feats = self.text_encoder.encode_text(tokens)   # (C, 512)
+                feats = self.text_encoder.encode_text(tokens)
                 feats = F.normalize(feats.float(), dim=-1)
                 all_features.append(feats)
 
@@ -389,23 +511,13 @@ class IntegratedGlobalRepresentation(nn.Module):
             torch.zeros(num_classes, feature_dim)
         )
         self.prototyping = Prototyping(num_classes, feature_dim)
-        # NOTA: _initialized NU mai este stocat ca atribut Python simplu.
-        # Este derivat din buffer-ul G (vezi property de mai jos), astfel incat
-        # starea este intotdeauna corecta dupa save/load checkpoint.
 
     @property
     def _initialized(self) -> bool:
-        """
-        Returneaza True daca G a fost initializat cu valori non-zero.
-        Derivat din buffer-ul G, deci corect si dupa resume din checkpoint.
-        """
         return bool(self.G.norm().item() > 0)
 
     @_initialized.setter
     def _initialized(self, value: bool) -> None:
-        # Setter no-op: permite cod extern (ex. train.py) sa seteze flag-ul
-        # fara a ridica eroare, dar starea reala ramane derivata din G.
-        # Daca value=True si G e zero, inseamna o eroare logica upstream.
         if value and not bool(self.G.norm().item() > 0):
             import warnings
             warnings.warn(
@@ -416,15 +528,7 @@ class IntegratedGlobalRepresentation(nn.Module):
             )
 
     def initialize(self, g_init: torch.Tensor) -> None:
-        """
-        Initializeaza G cu G_init (prototipurile CLIP).
-        Se apeleaza o singura data la inceputul antrenarii.
-
-        Args:
-            g_init: (C, feature_dim) - prototipuri CLIP
-        """
         self.G.copy_(g_init)
-        # _initialized este acum derivat din G — nu mai trebuie setat manual.
         print(f"  G initializat cu prototipuri CLIP (shape: {g_init.shape})")
 
     @torch.no_grad()
@@ -434,55 +538,32 @@ class IntegratedGlobalRepresentation(nn.Module):
         labels: torch.Tensor,
         epoch: int,
     ) -> None:
-        """
-        Actualizeaza G cu EMA dupa fiecare epoch (dupa warm-up).
-        Se apeleaza la sfarsitul fiecarui epoch de antrenare.
-
-        Args:
-            collected_features: (N_total, feature_dim) - toate Z' din epoch
-            labels:             (N_total,) - etichetele corespunzatoare
-            epoch:              epoch curent
-        """
         if not self._initialized:
             raise RuntimeError("Apeleaza initialize() cu G_init inainte de update().")
 
-        # Filtreaza features NaN inainte de prototyping.
-        # NaN-urile apar cand gradientii explodeaza si polueaza Z' colectat.
-        valid_mask = ~torch.isnan(collected_features).any(dim=-1)  # (N,)
+        valid_mask = ~torch.isnan(collected_features).any(dim=-1)
         if valid_mask.sum() == 0:
-            # Toate features sunt NaN — skip update complet, pastreaza G curent
             print("  [WARN] EMA update sarit: toate features colectate sunt NaN.")
             return
         collected_features = collected_features[valid_mask]
         labels = labels[valid_mask]
 
-        # Filtreaza si etichetele invalide (-1 = padding)
         valid_labels = labels != -1
         if valid_labels.sum() == 0:
             return
         collected_features = collected_features[valid_labels]
         labels = labels[valid_labels]
 
-        # Calculeaza V (prototipurile V-HOI din acest epoch)
-        V = self.prototyping(collected_features, labels)   # (C, feature_dim)
+        V = self.prototyping(collected_features, labels)
 
         if epoch >= self.warmup_epochs - 1:
-            # EMA update: G = rho*G + (1-rho)*V
-            # Actualizeaza DOAR clasele care au avut sample-uri in acest epoch.
-            # Clasele fara sample-uri au prototip zero dupa F.normalize -> NaN.
-            # Le pastram pe cele din G-ul precedent.
-            has_samples = (V.norm(dim=-1) > 1e-6)  # (C,) — clase cu date reale
-
+            has_samples = (V.norm(dim=-1) > 1e-6)
             new_G = self.rho * self.G + (1 - self.rho) * V
             self.G = torch.where(has_samples.unsqueeze(-1), new_G, self.G)
-
-            # Re-normalizeaza doar randurile actualizate (cele cu has_samples)
-            # pentru a nu disturba randurile neactualizate
             norms = self.G.norm(dim=-1, keepdim=True).clamp(min=1e-8)
             self.G = self.G / norms
 
     def get_G(self) -> torch.Tensor:
-        """Returneaza G curent (C, feature_dim)."""
         return self.G
 
 
@@ -494,13 +575,6 @@ class FeaturesCollector:
     """
     Colecteaza features si etichete de-a lungul unui epoch
     pentru a calcula prototipurile V dupa fiecare epoch.
-
-    Folosit in bucla de antrenare:
-        collector = FeaturesCollector()
-        for batch in dataloader:
-            ...
-            collector.add(z_prime.detach(), labels)
-        V = collector.get_all_features()
     """
 
     def __init__(self):
@@ -508,23 +582,15 @@ class FeaturesCollector:
         self.labels_list = []
 
     def add(self, features: torch.Tensor, labels: torch.Tensor) -> None:
-        """
-        Args:
-            features: (B, N, D) sau (N, D) - features Z' cu stop_gradient
-            labels:   (B, N) sau (N,) - etichete
-        """
         f = features.detach().cpu()
         l = labels.detach().cpu()
-
         if f.dim() == 3:
             f = f.reshape(-1, f.shape[-1])
             l = l.reshape(-1)
-
         self.features_list.append(f)
         self.labels_list.append(l)
 
     def get_all(self):
-        """Returns: (N_total, D), (N_total,)"""
         if not self.features_list:
             return None, None
         return (

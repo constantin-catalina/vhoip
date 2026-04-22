@@ -7,5 +7,13 @@ model:
   prompt_n_ctx: 16
   prompt_ctx_init: "a photo of a person"
 
+training:
+  # C6b: prompt regularization anchor weight.
+  # Keeps learned context from drifting too far from CLIP's original space.
+  # 0.1 is a light touch — strong enough to prevent collapse, weak enough
+  # to allow domain adaptation.
+  lambda3: 0.2
+  lambda4: 0.15
+
 logging:
   wandb_run_name: "{dataset}_c6b_fold{fold}"

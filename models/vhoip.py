@@ -13,6 +13,17 @@ Pipeline training (Fig. 2 din VHOIP paper):
 Pipeline inference:
   - Identic cu 2G-GCN (fara costuri suplimentare)
   - Se folosesc doar segment_logits din backbone
+
+C6b improvements in this file:
+  1. FIX: T is correctly populated before switching to inference mode via
+     set_inference_mode(), so evaluation uses the real learned T, not zeros.
+  2. Temperature scaling: cosine similarities are multiplied by
+     text_encoder.temperature (learnable scalar, exp(log_temp)) before
+     being passed to L_Cos — matches how CLIP trains its own contrastive head.
+  3. Prompt regularization loss (L_PromptReg): cosine similarity between
+     learned T and frozen T, averaged over classes and returned in the output
+     dict so losses.py can include it in the total.
+     lambda4 controls its weight (default 0.1 — light anchor, not dominant).
 """
 
 import torch
@@ -42,7 +53,6 @@ class VHOIP(nn.Module):
     Args:
         cfg:         configuratia completa (din YAML, merge base + dataset)
         label_names: lista de verbe/activitati pentru template-urile CLIP
-                     (ex. ["approach", "lift", "pour", ...] pentru MPHOI-72)
         device:      torch device ("cuda" sau "cpu")
     """
 
@@ -58,11 +68,10 @@ class VHOIP(nn.Module):
         self.num_classes = cfg.model.num_classes
         self.hidden_dim = cfg.model.hidden_dim
         self.clip_dim = cfg.model.clip_dim
+        self.use_learnable_prompts = getattr(cfg.model, "use_learnable_prompts", False)
 
         # -----------------------------------------------------------------------
         # Backbone 2G-GCN (geometric GCN + fusion graph + BiRNN)
-        # Parametrii geo_input_dim, C1, C2 pot fi configurati in YAML.
-        # Valorile default C1=64, C2=128 sunt din paper.
         # -----------------------------------------------------------------------
         self.backbone = Backbone2GGCN(
             input_dim=cfg.data.roi_dim,
@@ -77,7 +86,6 @@ class VHOIP(nn.Module):
 
         # -----------------------------------------------------------------------
         # MLP Projection Z -> Z'  (VHOIP §3.2)
-        # Two-layer MLP cu GELU, output L2-normalizat
         # -----------------------------------------------------------------------
         self.mlp_proj = MLPProjection(
             input_dim=cfg.model.hidden_dim,
@@ -87,7 +95,6 @@ class VHOIP(nn.Module):
 
         # -----------------------------------------------------------------------
         # Discriminator MI  (Eq. 1 din paper)
-        # Primeste Z (hidden_dim) si G (clip_dim) si produce scoruri binare
         # -----------------------------------------------------------------------
         self.discriminator = Discriminator(
             feature_dim=cfg.model.hidden_dim,
@@ -95,19 +102,20 @@ class VHOIP(nn.Module):
         )
 
         # -----------------------------------------------------------------------
-        # CLIP Text Encoder (frozen, or with learnable prompts for C6b)
+        # CLIP Text Encoder (frozen CLIP, optional learnable prompts for C6b)
+        # num_classes passed so LearnablePromptEncoder can allocate class offsets.
         # -----------------------------------------------------------------------
         self.text_encoder = CLIPTextEncoder(
             model_name=cfg.model.clip_model,
             device=device,
-            use_learnable_prompts=getattr(cfg.model, "use_learnable_prompts", False),
+            use_learnable_prompts=self.use_learnable_prompts,
             n_ctx=getattr(cfg.model, "prompt_n_ctx", 16),
             ctx_init=getattr(cfg.model, "prompt_ctx_init", "a photo of a person"),
+            num_classes=cfg.model.num_classes,
         )
 
         # -----------------------------------------------------------------------
-        # Reprezentarea globala integrata G  (VHOIP §3.2, Alg. 1)
-        # G = rho*G + (1-rho)*V  dupa warm-up
+        # Rappresentazione globale integrata G  (VHOIP §3.2, Alg. 1)
         # -----------------------------------------------------------------------
         self.global_rep = IntegratedGlobalRepresentation(
             num_classes=cfg.model.num_classes,
@@ -119,66 +127,48 @@ class VHOIP(nn.Module):
         # Colector features Z' pentru EMA update la sfarsitul epoch-ului
         self.collector = FeaturesCollector()
 
-        # Store label info needed to recompute T dynamically in C6b
-        self.use_learnable_prompts = getattr(cfg.model, "use_learnable_prompts", False)
+        # Store label info
         self._label_names = label_names
         self._clip_subject = cfg.dataset.clip_subject
         self._clip_template = cfg.dataset.clip_template
 
-        if self.use_learnable_prompts:
-            # T is recomputed each forward pass — register placeholder for state_dict
-            self.register_buffer("T", torch.zeros(cfg.model.num_classes, cfg.model.clip_dim))
-            print("  C6b: T will be recomputed dynamically during training")
-        else:
-            self.register_buffer(
-                "T",
-                self._compute_text_features(
-                    label_names,
-                    subject=cfg.dataset.clip_subject,
-                    template=cfg.dataset.clip_template,
-                ),
-            )
+        # -----------------------------------------------------------------------
+        # Precompute frozen T — used for both baseline T and prompt reg loss.
+        # This is correct for ALL modes (C6, C6b, baseline).
+        # -----------------------------------------------------------------------
+        frozen_T = self.text_encoder.precompute_frozen_T(
+            label_names,
+            subject=cfg.dataset.clip_subject,
+            template=cfg.dataset.clip_template,
+        )
+        num_templates = (
+            len(cfg.dataset.clip_template)
+            if isinstance(cfg.dataset.clip_template, (list,))
+            else 1
+        )
+        print(f"  Text features T precomputed: {frozen_T.shape} ({num_templates} template(s) ensembled)")
 
-        # Flag pentru modul inference
+        if self.use_learnable_prompts:
+            # T will be recomputed each forward pass — register a buffer as
+            # placeholder so state_dict() includes it and inference works correctly
+            # after set_inference_mode() is called (see FIX below).
+            self.register_buffer("T", frozen_T.clone())
+            print("  C6b: T buffer initialized from frozen templates; "
+                  "will be updated dynamically during training and before inference.")
+        else:
+            self.register_buffer("T", frozen_T)
+
+        # C6b prompt regularization weight
+        self._lambda4 = getattr(cfg.training, "lambda4", 0.1)
+
+        # Flag para modo de inferencia
         self._inference_mode = False
 
     # ---------------------------------------------------------------------------
     # Initializare
     # ---------------------------------------------------------------------------
 
-    def _compute_text_features(
-        self,
-        label_names: List[str],
-        subject: str,
-        template,   # str or ListConfig/list
-    ) -> torch.Tensor:
-        """Precomputa T la initializare (frozen, nu se recalculeaza in training)."""
-        # OmegaConf returns ListConfig when template is a YAML list — convert to plain list
-        from omegaconf import ListConfig
-        if isinstance(template, ListConfig):
-            template = list(template)
-
-        with torch.no_grad():
-            T = self.text_encoder.encode_labels(
-                label_names,
-                subject=subject,
-                template=template,
-            )
-        num_templates = len(template) if isinstance(template, list) else 1
-        print(f"  Text features T precomputed: {T.shape} ({num_templates} template(s) ensembled)")
-        return T
-
     def initialize_G(self, clip_visual_features: torch.Tensor, labels: torch.Tensor) -> None:
-        """
-        Initializeaza G cu prototipurile CLIP vizuale (G_init, stanga Fig. 2).
-
-        Se apeleaza O SINGURA DATA inainte de antrenare, dupa ce features
-        CLIP vizuale au fost extrase pentru intregul training set.
-
-        Args:
-            clip_visual_features: (N_total, clip_dim) — features CLIP vizuale
-            labels:               (N_total,) — etichete corespunzatoare
-        """
         from models.clip_modules import Prototyping
         proto = Prototyping(self.num_classes, self.clip_dim)
         g_init = proto(
@@ -189,12 +179,6 @@ class VHOIP(nn.Module):
         print(f"  G initializat cu prototipuri CLIP vizuale (shape: {g_init.shape})")
 
     def initialize_G_from_text(self) -> None:
-        """
-        Fallback: initializeaza G din text features T.
-
-        Folosit cand features CLIP vizuale nu sunt disponibile.
-        T este deja in spatiul CLIP 512-dim, L2-normalizat.
-        """
         self.global_rep.initialize(self.T.clone())
         print(f"  G initializat din text features T (shape: {self.T.shape})")
 
@@ -213,25 +197,16 @@ class VHOIP(nn.Module):
         """
         Forward pass VHOIP.
 
-        Args:
-            roi_features:   (B, S, M, 2048) — ROI pooling features din Faster R-CNN
-            geo_features:   (B, S, J, 4)    — keypoints geometrice (optional)
-            entity_types:   (B, M)          — 0=human, 1=object (optional)
-            labels:         (B, N)          — etichete ground-truth (optional)
-            training_stage: 1 = ASSIGN Stage 1 (dense, L_Seg off)
-                            2 = ASSIGN Stage 2 (full Gumbel-Softmax, default)
-                            Ignorat la inferenta.
+        Returns at training:
+            segment_logits, frame_logits, u_soft,
+            mi_scores, cos_similarities, z_prime,
+            prompt_reg_loss (scalar, 0.0 if not C6b)
 
-        Returns:
-            La training:
-                dict cu: segment_logits, frame_logits, u_soft,
-                         mi_scores, cos_similarities, z_prime
-            La inferenta (inference_mode=True):
-                dict cu: segment_logits, frame_logits
+        Returns at inference:
+            segment_logits, frame_logits
         """
         # -----------------------------------------------------------------------
         # Pas 1: Backbone 2G-GCN + ASSIGN
-        # Extrage Z (primul nivel BiRNN), frame/segment logits, u_soft
         # -----------------------------------------------------------------------
         backbone_out = self.backbone(
             roi_features=roi_features,
@@ -239,12 +214,11 @@ class VHOIP(nn.Module):
             entity_types=entity_types,
             training_stage=training_stage,
         )
-        z              = backbone_out["z"]              # (B, N, hidden_dim)
-        frame_logits   = backbone_out["frame_logits"]   # (B, N, C)
-        segment_logits = backbone_out["segment_logits"] # (B, N, C)
-        u_soft         = backbone_out["u_soft"]         # (B, N)
+        z              = backbone_out["z"]
+        frame_logits   = backbone_out["frame_logits"]
+        segment_logits = backbone_out["segment_logits"]
+        u_soft         = backbone_out["u_soft"]
 
-        # La inferenta, returnam doar output-ul backbone-ului
         if self._inference_mode:
             return {
                 "segment_logits": segment_logits,
@@ -252,50 +226,68 @@ class VHOIP(nn.Module):
             }
 
         # -----------------------------------------------------------------------
-        # Pas 2: MLP Projection Z -> Z'  (VHOIP §3.2)
-        # Z vine din PRIMUL nivel BiRNN (frame-level), L2-normalizat
+        # Pas 2: MLP Projection Z -> Z'
         # -----------------------------------------------------------------------
         z_prime = self.mlp_proj(z)   # (B, N, clip_dim), L2-normalizat
 
         # -----------------------------------------------------------------------
         # Pas 3: Discriminator MI  (Eq. 1)
-        # z: (B, N, hidden_dim) — L2-normalizat in interiorul Discriminator.forward()
-        # G: (C, clip_dim)
-        # mi_scores: (B, N, C) — logit-uri brute (sigmoid in BCEWithLogitsLoss)
         # -----------------------------------------------------------------------
-        G = self.global_rep.get_G()              # (C, clip_dim)
-        mi_scores = self.discriminator(z, G)     # (B, N, C)
+        G = self.global_rep.get_G()
+        mi_scores = self.discriminator(z, G)
 
         # -----------------------------------------------------------------------
-        # Pas 4: Similaritate cosinus Z' vs T  (Eq. 3)
-        # Ambii sunt L2-normalizati => dot product = cosine similarity
-        # T: (C, clip_dim), z_prime: (B, N, clip_dim)
-        # cos_similarities: (B, N, C)
+        # Pas 4: Text features T + cosine similarity with temperature scaling
         # -----------------------------------------------------------------------
         if self.use_learnable_prompts:
-            # C6b: recompute T each step so gradients flow through ctx vectors
+            # C6b: recompute T — gradients flow through ctx and class offsets
             T = self.text_encoder.encode_labels(
                 self._label_names,
                 subject=self._clip_subject,
+                # template intentionally NOT passed: learnable prompts replace templates
             )
+            # Update the T buffer so it's available at inference time (FIX #4)
+            with torch.no_grad():
+                self.T.copy_(T.detach())
         else:
-            T = self.T  # frozen buffer, computed once at init
-        cos_similarities = torch.einsum("bnd,cd->bnc", z_prime, T)
+            T = self.T
+
+        # Apply learnable temperature to cosine similarities.
+        # Both z_prime and T are L2-normalised, so einsum = cosine similarity.
+        # Multiplying by temperature sharpens the distribution (same as CLIP).
+        cos_similarities = torch.einsum("bnd,cd->bnc", z_prime, T) * self.text_encoder.temperature
 
         # -----------------------------------------------------------------------
-        # Colecteaza Z' pentru EMA update la sfarsitul epoch-ului (Alg. 1)
-        # stop_gradient: .detach() este aplicat in FeaturesCollector.add()
+        # Pas 5: Prompt regularization loss (C6b only)
+        # L_PromptReg = 1 - mean cosine similarity between learned T and frozen T.
+        # This anchors the context vectors to the CLIP space they started from,
+        # preventing catastrophic drift while still allowing adaptation.
+        # -----------------------------------------------------------------------
+        if self.use_learnable_prompts:
+            frozen_T = self.text_encoder.get_frozen_T()
+            if frozen_T is not None:
+                # Both T and frozen_T are L2-normalised — dot product = cosine sim
+                cos_sim_prompt = (T * frozen_T.to(T.device)).sum(dim=-1)  # (C,)
+                prompt_reg_loss = (1.0 - cos_sim_prompt).mean()
+            else:
+                prompt_reg_loss = torch.tensor(0.0, device=z.device)
+        else:
+            prompt_reg_loss = torch.tensor(0.0, device=z.device)
+
+        # -----------------------------------------------------------------------
+        # Collect Z' for EMA update
         # -----------------------------------------------------------------------
         if labels is not None:
             self.collector.add(z_prime, labels)
 
         return {
-            "segment_logits":   segment_logits,    # (B, N, C) — pentru L_Label
-            "frame_logits":     frame_logits,      # (B, N, C) — pentru L_Seg
-            "u_soft":           u_soft,            # (B, N)    — pentru L_Seg (ASSIGN Eq. 11)
-            "mi_scores":        mi_scores,         # (B, N, C) — pentru L_MI
-            "cos_similarities": cos_similarities,  # (B, N, C) — pentru L_Cos
-            "z_prime":          z_prime,           # (B, N, clip_dim)
+            "segment_logits":   segment_logits,
+            "frame_logits":     frame_logits,
+            "u_soft":           u_soft,
+            "mi_scores":        mi_scores,
+            "cos_similarities": cos_similarities,
+            "z_prime":          z_prime,
+            "prompt_reg_loss":  prompt_reg_loss,   # new: used by VHOIPLoss
         }
 
     # ---------------------------------------------------------------------------
@@ -303,11 +295,6 @@ class VHOIP(nn.Module):
     # ---------------------------------------------------------------------------
 
     def end_of_epoch(self, epoch: int) -> None:
-        """
-        Apelat la sfarsitul fiecarui epoch de antrenare.
-        Calculeaza prototipurile V si actualizeaza G cu EMA (Alg. 1).
-        Reseteaza colectorul pentru epoch-ul urmator.
-        """
         features, labels = self.collector.get_all()
         if features is not None:
             self.global_rep.update(
@@ -318,7 +305,24 @@ class VHOIP(nn.Module):
         self.collector.reset()
 
     def set_inference_mode(self, inference: bool = True) -> None:
-        """Comuta intre modul training si modul inferenta."""
+        """
+        Switch between training and inference mode.
+
+        FIX: In C6b mode, we ensure self.T is populated with the current
+        learned text features BEFORE switching to eval mode, so that any
+        subsequent inference run uses the real learned T instead of zeros
+        or stale values from a previous epoch.
+        """
+        if inference and self.use_learnable_prompts:
+            # Recompute T one final time and freeze it into the buffer
+            with torch.no_grad():
+                T_final = self.text_encoder.encode_labels(
+                    self._label_names,
+                    subject=self._clip_subject,
+                )
+                self.T.copy_(T_final)
+            print("  C6b: T buffer updated with learned prompt features for inference.")
+
         self._inference_mode = inference
         if inference:
             self.eval()
@@ -326,11 +330,6 @@ class VHOIP(nn.Module):
             self.train()
 
     def get_trainable_params(self) -> tuple:
-        """
-        Returneaza (lista_antrenabili, lista_frozen).
-        Util pentru debug si pentru configurarea optimizer-ului.
-        CLIP (text_encoder) trebuie sa fie mereu frozen.
-        """
         trainable, frozen = [], []
         for name, param in self.named_parameters():
             if param.requires_grad:
@@ -340,7 +339,6 @@ class VHOIP(nn.Module):
         return trainable, frozen
 
     def count_parameters(self) -> Dict[str, int]:
-        """Numara parametrii modelului (total, antrenabili, frozen)."""
         total = sum(p.numel() for p in self.parameters())
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         return {
