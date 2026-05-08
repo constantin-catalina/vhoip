@@ -5,6 +5,7 @@ Logging in terminal si TensorBoard.
 
 import os
 import logging
+from typing import Optional
 from torch.utils.tensorboard import SummaryWriter
 
 try:
@@ -72,7 +73,9 @@ class Logger:
                 self.writer.add_scalar(f"Loss/{name}", val, step)
 
         if self.wandb_run is not None:
-            self.wandb_run.log({f"loss/{name}": val for name, val in losses.items()}, step=step)
+            log_dict = {f"loss/{name}": float(val) for name, val in losses.items()}
+            self.wandb_run.log(log_dict, step=step)
+            self.log.info(f"  [W&B] Logged losses at step {step}: {list(log_dict.keys())}")
 
     def log_metrics(self, metrics: dict, epoch: int, split: str = "val") -> None:
         if self.writer is not None:
@@ -81,10 +84,13 @@ class Logger:
                     self.writer.add_scalar(f"Metrics_{split}/{name}", val, epoch)
 
         if self.wandb_run is not None:
-            self.wandb_run.log(
-                {f"metrics/{split}/{name}": val for name, val in metrics.items() if not name.endswith("_std")},
-                step=epoch,
-            )
+            log_dict = {
+                f"metrics/{split}/{name}": float(val)
+                for name, val in metrics.items()
+                if not name.endswith("_std")
+            }
+            self.wandb_run.log(log_dict, step=epoch)
+            self.log.info(f"  [W&B] Logged metrics at step {epoch}: {list(log_dict.keys())}")
 
         self.log.info(
             f"Epoch {epoch} [{split}] | "

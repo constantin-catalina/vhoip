@@ -181,9 +181,9 @@ class LearnablePromptEncoder(nn.Module):
                 init_embeddings = clip_model.token_embedding(ctx_init_tokens)
                 # Take exactly n_ctx tokens starting after SOS
                 init_ctx = init_embeddings[0, 1:n_ctx + 1, :]  # (n_ctx, clip_dim)
-            self.ctx = nn.Parameter(init_ctx.float())
+            self.ctx = nn.Parameter(init_ctx.to(self.dtype))
         else:
-            ctx_vectors = torch.empty(n_ctx, clip_dim)
+            ctx_vectors = torch.empty(n_ctx, clip_dim, dtype=self.dtype)
             nn.init.normal_(ctx_vectors, std=0.02)
             self.ctx = nn.Parameter(ctx_vectors)
 
@@ -192,7 +192,7 @@ class LearnablePromptEncoder(nn.Module):
         # so the model starts at the shared-context baseline and can diverge
         # gradually as training provides class-specific gradients.
         self.class_ctx_offsets = nn.Parameter(
-            torch.zeros(num_classes, n_ctx, clip_dim)
+            torch.zeros(num_classes, n_ctx, clip_dim, dtype=self.dtype)
         )
 
         for param in self.clip_model.parameters():
@@ -263,7 +263,7 @@ class LearnablePromptEncoder(nn.Module):
 
             composed_list.append(composed)
 
-        composed_batch = torch.stack(composed_list, dim=0)              # (C, seq_len, D)
+        composed_batch = torch.stack(composed_list, dim=0).type(self.dtype)  # (C, seq_len, D)
 
         # Run through CLIP transformer (same as original)
         x = composed_batch + self.clip_model.positional_embedding.type(self.dtype)
@@ -309,6 +309,11 @@ class CLIPTextEncoder(nn.Module):
         self.use_learnable_prompts = use_learnable_prompts
 
         clip_model, _ = clip.load(model_name, device=device)
+        # C6b: force float32 for the text encoder.  CLIP loads in fp16 on CUDA
+        # by default, but back-prop through a frozen fp16 transformer with
+        # learnable inputs is numerically unstable and produces NaN after a
+        # handful of steps.
+        clip_model = clip_model.float()
         self.text_encoder = clip_model
         self.feature_dim = 512
 
@@ -317,8 +322,10 @@ class CLIPTextEncoder(nn.Module):
 
         # Learnable temperature (log-space for stability).
         # exp(log_temp) is the scale applied to cosine similarities.
-        # Initialized to CLIP's default 1/0.07 ≈ 14.3 -> log(14.3) ≈ 2.66
-        self.log_temp = nn.Parameter(torch.tensor(2.6593))  # learnable
+        # Start at 1.0 (log_temp=0) so training is stable at the beginning;
+        # the model can learn to scale up if needed.  Using float32 explicitly
+        # avoids accidental float64 promotion that breaks mixed-precision.
+        self.log_temp = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))  # learnable
 
         if use_learnable_prompts:
             assert num_classes > 0, "num_classes must be set when use_learnable_prompts=True"

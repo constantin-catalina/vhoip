@@ -10,6 +10,8 @@ Utilizare:
 
 import argparse
 import os
+import random
+import numpy as np
 import torch
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
@@ -27,6 +29,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Antrenare VHOIP")
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--fold", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=42, help="Random seed pentru reproductibilitate")
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--wandb", action="store_true", help="Activeaza logging in Weights & Biases")
     parser.add_argument("--wandb_project", type=str, default=None, help="Numele proiectului W&B")
@@ -38,6 +41,27 @@ def parse_args():
         default="cuda" if torch.cuda.is_available() else "cpu",
     )
     return parser.parse_args()
+
+
+def set_seed(seed: int):
+    """Seteaza seed-ul pentru toate librariile de randomizare."""
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+
+def worker_init_fn(worker_id: int):
+    """Initializer pentru workerii DataLoader cu seed propriu."""
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 def get_label_names(dataset_name: str):
@@ -116,11 +140,21 @@ def train_one_epoch(model, dataloader, optimizer, criterion, scaler, device, log
                 frame_labels=frame_labels,
                 anticipation_labels=ant_labels,
                 training_stage=current_stage,
+                prompt_reg_loss=outputs.get("prompt_reg_loss"),
             )
+
+        if torch.isnan(losses["total"]) or torch.isinf(losses["total"]):
+            logger.info(
+                f"  [WARN] NaN/Inf loss at batch {batch_idx} — skipping step."
+            )
+            optimizer.zero_grad()
+            continue
 
         scaler.scale(losses["total"]).backward()
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=cfg.training.grad_clip)
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            model.parameters(), max_norm=cfg.training.grad_clip
+        )
         scaler.step(optimizer)
         scaler.update()
 
@@ -133,7 +167,8 @@ def train_one_epoch(model, dataloader, optimizer, criterion, scaler, device, log
                 f"Loss={losses['total'].item():.4f} "
                 f"Ant={losses['l_ant'].item():.4f} "
                 f"MI={losses['l_mi'].item():.4f} "
-                f"Cos={losses['l_cos'].item():.4f}"
+                f"Cos={losses['l_cos'].item():.4f} "
+                f"GradNorm={grad_norm:.2f}"
             )
 
     model.end_of_epoch(epoch)
@@ -246,6 +281,7 @@ def evaluate(model, dataloader, device, iou_thresholds):
 
 def main():
     args = parse_args()
+    set_seed(args.seed)
     device = torch.device(args.device)
 
     cfg = OmegaConf.merge(
@@ -312,6 +348,7 @@ def main():
         train_ds, batch_size=cfg.training.batch_size,
         shuffle=True, num_workers=cfg.data.num_workers, pin_memory=cfg.data.pin_memory,
         collate_fn=collate_fn,
+        worker_init_fn=worker_init_fn,
     )
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, collate_fn=collate_fn)
     logger.info(f"Train: {len(train_ds)} video-uri | Val: {len(val_ds)} video-uri")
@@ -377,8 +414,18 @@ def main():
         initialize_global_representation(model, train_loader, device, logger)
 
     logger.info("Incep antrenarea...")
+    stage1_epochs = cfg.training.get("stage1_epochs", 5)
     for epoch in range(start_epoch, cfg.training.epochs):
-        logger.info(f"\nEpoch {epoch + 1}/{cfg.training.epochs}")
+        # GSM temperature annealing: 1.0 -> 0.5 over stage 2
+        if epoch >= stage1_epochs:
+            t = min((epoch - stage1_epochs) / max(cfg.training.epochs - stage1_epochs, 1), 1.0)
+            temp = 1.0 - 0.5 * t
+            model.backbone.set_gsm_temperature(temp)
+
+        logger.info(
+            f"\nEpoch {epoch + 1}/{cfg.training.epochs}  "
+            f"(GSM temp={model.backbone.boundary_detector.temperature:.3f})"
+        )
 
         train_losses = train_one_epoch(
             model, train_loader, optimizer, criterion,

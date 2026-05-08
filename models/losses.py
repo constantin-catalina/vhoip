@@ -133,7 +133,7 @@ class MutualInformationLoss(nn.Module):
 class CosineSimilarityLoss(nn.Module):
     def __init__(self):
         super().__init__()
-        self.ce = nn.CrossEntropyLoss(ignore_index=-1)
+        self.ce = nn.CrossEntropyLoss(ignore_index=-1, label_smoothing=0.1)
 
     def forward(self, similarities: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         if similarities.dim() == 3:
@@ -180,7 +180,7 @@ class VHOIPLoss(nn.Module):
         self.lambda_ant = lambda_ant
         self.lambda4 = lambda4
 
-        self.l_label = nn.CrossEntropyLoss(ignore_index=-1)
+        self.l_label = nn.CrossEntropyLoss(ignore_index=-1, label_smoothing=0.1)
         self.l_seg   = SegmentationLoss(sigma=seg_sigma)
         self.l_mi    = MutualInformationLoss()
         self.l_cos   = CosineSimilarityLoss()
