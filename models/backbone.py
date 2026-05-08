@@ -307,7 +307,7 @@ class SegmentLevelLayer(nn.Module):
       contextul din segmentul anterior — echivalent functional cu
       versiunea online a ASSIGN pentru antrenare pe video complete.
 
-    Mesajele segment-level m^{inter/intra}_{t,s} (Eq. 6–7) se calculeaza
+    Mesajele segment-level m^{inter/intra}_{t,s} (Eq. 6-7) se calculeaza
     iterativ, frame cu frame, folosind h_s acumulat pana la t.
     Deoarece BiRNN este bidirectional (necesita toate frame-urile),
     folosim o aproximatie: calculam mesajele pe h_f_fused (forward pass)

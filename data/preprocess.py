@@ -553,26 +553,13 @@ def parse_args():
         "--device", type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
     )
-    parser.add_argument(
-        "--synthetic", action="store_true",
-        help="Genereaza date sintetice (pentru testare fara date reale)",
-    )
-    parser.add_argument("--num_classes", type=int, default=10)
-    parser.add_argument("--num_videos", type=int, default=40)
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
 
-    if args.synthetic:
-        print(f"Generare date sintetice pentru {args.dataset}...")
-        _generate_synthetic_data(
-            args.data_root,
-            num_videos=args.num_videos,
-            num_classes=args.num_classes,
-        )
-    elif args.dataset == "cad120":
+    if args.dataset == "cad120":
         preprocess_cad120(args.data_root, args.device)
     else:
         raise NotImplementedError(

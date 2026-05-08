@@ -35,6 +35,6 @@ training:
 logging:
   wandb_enabled: true
   wandb_project: "vhoip"
-  wandb_run_name: "{dataset}_v2_fold{fold}"
+  wandb_run_name: "{dataset}_v2_fold{fold}_seed{seed}"
   local_logging_enabled: false    # no TensorBoard files
   local_checkpoints_enabled: true
