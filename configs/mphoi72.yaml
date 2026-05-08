@@ -1,15 +1,12 @@
-# Configuratie specifica datasetului MPHOI-72
-# Cel mai complex - multi-person, occlusions frecvente
-
 defaults:
   - base
 
 dataset:
   name: "mphoi72"
   root: "data/mphoi72/"
-  num_classes: 13                # sub-activitati
+  num_classes: 13               
   num_subjects: 12
-  cross_validation: "two_subject_out"   # 2 subiecti in test
+  cross_validation: "two_subject_out"   
 
   clip_subject: "person"
   clip_template: "A photo of a person {verb}"
@@ -22,16 +19,16 @@ training:
   batch_size: 1
   stage1_epochs: 5
   stage2_epochs: 50
-  lambda1_start: 0.1      # L_Seg starts small
-  lambda1_final: 1.0      # L_Seg reaches full weight by epoch 30
+  lambda1_start: 0.1  
+  lambda1_final: 1.0     
 
-  scheduler: "plateau"        # add this key
-  scheduler_patience: 5       # reduce LR if no improvement for 5 evals
-  scheduler_factor: 0.5       # halve the LR
+  scheduler: "plateau"        
+  scheduler_patience: 5       
+  scheduler_factor: 0.5       
 
 logging:
   wandb_enabled: true
   wandb_project: "vhoip"
-  wandb_run_name: "{dataset}_v2_fold{fold}"
-  local_logging_enabled: false    # no TensorBoard files
+  wandb_run_name: "{dataset}_fold{fold}"
+  local_logging_enabled: false    
   local_checkpoints_enabled: true

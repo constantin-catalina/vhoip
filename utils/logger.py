@@ -25,6 +25,7 @@ class Logger:
         wandb_config: dict = None,
         wandb_group: str = None,
         wandb_job_type: str = "fold",
+        wandb_id: str = None,
         enable_local_logging: bool = True,
     ):
         self.enable_local_logging = enable_local_logging
@@ -51,7 +52,7 @@ class Logger:
             if wandb is None:
                 self.log.warning("W&B activat, dar pachetul wandb nu este instalat. Continui fara W&B.")
             else:
-                self.wandb_run = wandb.init(
+                init_kwargs = dict(
                     project=wandb_project,
                     entity=wandb_entity,
                     name=wandb_run_name or experiment_name,
@@ -59,6 +60,10 @@ class Logger:
                     group=wandb_group,
                     job_type=wandb_job_type,
                 )
+                if wandb_id is not None:
+                    init_kwargs["id"] = wandb_id
+                    init_kwargs["resume"] = "allow"
+                self.wandb_run = wandb.init(**init_kwargs)
                 self.log.info("W&B initializat cu succes")
 
     def log_losses(self, losses: dict, step: int) -> None:
@@ -94,19 +99,26 @@ class Logger:
 
     def log_checkpoint_artifact(
         self,
-        checkpoint_path: str,
+        checkpoint_path: Optional[str],
         epoch: int,
         metrics: dict,
         is_best: bool = False,
-        best_checkpoint_path: str = None,
+        best_checkpoint_path: Optional[str] = None,
     ) -> None:
         if self.wandb_run is None or wandb is None:
             return
-        if checkpoint_path is None or not os.path.exists(checkpoint_path):
+
+        # Cel putin unul dintre checkpoint-uri trebuie sa existe.
+        has_checkpoint = checkpoint_path is not None and os.path.exists(checkpoint_path)
+        has_best = best_checkpoint_path is not None and os.path.exists(best_checkpoint_path)
+        if not has_checkpoint and not has_best:
             return
 
+        # Include wandb run ID in artifact name so different runs on the same fold
+        # do not overwrite each other's checkpoints.
+        run_id = self.wandb_run.id if self.wandb_run else "local"
         artifact = wandb.Artifact(
-            name=f"{self.experiment_name}-epoch-{epoch:03d}",
+            name=f"{self.experiment_name}-{run_id}-epoch-{epoch:03d}",
             type="model",
             metadata={
                 "epoch": epoch,
@@ -116,9 +128,10 @@ class Logger:
                 "f1_50": metrics.get("f1_50", 0.0),
             },
         )
-        artifact.add_file(checkpoint_path, name=os.path.basename(checkpoint_path))
+        if has_checkpoint:
+            artifact.add_file(checkpoint_path, name=os.path.basename(checkpoint_path))
 
-        if is_best and best_checkpoint_path and os.path.exists(best_checkpoint_path):
+        if has_best:
             artifact.add_file(best_checkpoint_path, name=os.path.basename(best_checkpoint_path))
 
         aliases = ["latest", f"epoch-{epoch:03d}"]

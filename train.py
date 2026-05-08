@@ -49,6 +49,16 @@ def get_label_names(dataset_name: str):
     return mapping[dataset_name]
 
 
+def generate_run_id() -> str:
+    """Genereaza un ID unic pentru rulare (folosit pentru izolarea checkpoints/logs)."""
+    try:
+        import wandb
+        return wandb.util.generate_id()
+    except Exception:
+        import uuid
+        return uuid.uuid4().hex[:8]
+
+
 def train_one_epoch(model, dataloader, optimizer, criterion, scaler, device, logger, epoch, cfg):
     model.train()
     model.set_inference_mode(False)
@@ -245,13 +255,18 @@ def main():
 
     experiment_name = f"{cfg.dataset.name}_fold{args.fold}"
 
-    # Fiecare fold primeste propriul subdirector pentru checkpoints si logs,
-    # altfel fold-urile se suprascriu reciproc (best_model.pth, TensorBoard etc.)
-    # Rezultat: checkpoints/mphoi72_fold0/, checkpoints/mphoi72_fold1/, ...
+    # Fiecare fold primeste propriul subdirector pentru checkpoints si logs.
+    # In plus, fiecare rulare primeste un ID unic (run_id) astfel incat
+    # reluari sau experimente multiple pe acelasi fold sa NU se suprascrie.
+    # Rezultat: checkpoints/mphoi72_fold0/<run_id>/best_model.pth
+    run_id = generate_run_id()
     base_checkpoint_dir = OmegaConf.select(cfg, "logging.checkpoint_dir", default="checkpoints/")
     base_log_dir = OmegaConf.select(cfg, "logging.log_dir", default="logs/")
-    OmegaConf.update(cfg, "logging.checkpoint_dir", os.path.join(base_checkpoint_dir, experiment_name))
-    OmegaConf.update(cfg, "logging.log_dir", os.path.join(base_log_dir, experiment_name))
+    OmegaConf.update(cfg, "logging.checkpoint_dir", os.path.join(base_checkpoint_dir, experiment_name, run_id))
+    OmegaConf.update(cfg, "logging.log_dir", os.path.join(base_log_dir, experiment_name, run_id))
+    print(f"Run ID: {run_id}")
+    print(f"  Checkpoints: {cfg.logging.checkpoint_dir}")
+    print(f"  Logs:        {cfg.logging.log_dir}")
 
     wandb_enabled_cfg = bool(OmegaConf.select(cfg, "logging.wandb_enabled", default=False))
     wandb_project_cfg = OmegaConf.select(cfg, "logging.wandb_project", default="vhoip")
@@ -281,6 +296,7 @@ def main():
         wandb_config=OmegaConf.to_container(cfg, resolve=True),
         wandb_group=cfg.dataset.name,
         wandb_job_type="fold",
+        wandb_id=run_id,
         enable_local_logging=local_logging_enabled,
     )
     logger.info(f"Config: {args.config} | Device: {device} | Fold: {args.fold}")
@@ -382,7 +398,7 @@ def main():
         is_best = metrics["fsum"] > best_fsum
         if is_best:
             best_fsum = metrics["fsum"]
-            save_checkpoint(
+            saved = save_checkpoint(
                 model,
                 optimizer,
                 epoch,
@@ -391,6 +407,15 @@ def main():
                 is_best=True,
                 save_local=local_checkpoints_enabled,
             )
+            # Log checkpoint ca artifact W&B (izolat per run_id)
+            if saved.get("best_checkpoint"):
+                logger.log_checkpoint_artifact(
+                    checkpoint_path=None,
+                    epoch=epoch,
+                    metrics=metrics,
+                    is_best=True,
+                    best_checkpoint_path=saved["best_checkpoint"],
+                )
 
 
     logger.info(f"\nAntrenare finalizata. Best FSUM: {best_fsum:.1f}")
