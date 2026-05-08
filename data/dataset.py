@@ -14,6 +14,8 @@ import torch
 from torch.utils.data import Dataset
 from typing import Dict, List, Tuple, Optional
 
+from data.mphoi72_dataset import MPHOI72_ACTIVITY_LABELS
+
 
 class HOIVideoDataset(Dataset):
     """
@@ -116,11 +118,7 @@ class MPHOI72Dataset(HOIVideoDataset):
     NUM_CLASSES = 13
     NUM_SUBJECTS = 12
 
-    ACTIVITY_LABELS = [
-        "approaching", "lifting", "pouring", "placing", "drinking",
-        "cheering", "retreating", "working", "asking", "solving",
-        "sitting", "cutting", "drying",
-    ]
+    ACTIVITY_LABELS = MPHOI72_ACTIVITY_LABELS
 
     def __init__(self, root: str, split: str = "train", fold: int = 0, **kwargs):
         super().__init__(root, split, fold, **kwargs)

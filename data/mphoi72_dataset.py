@@ -51,8 +51,14 @@ import zarr
 
 
 # ---------------------------------------------------------------------------
-# Constante geometrice
+# Constante dataset
 # ---------------------------------------------------------------------------
+
+MPHOI72_ACTIVITY_LABELS = [
+    "approaching", "lifting", "pouring", "placing", "drinking",
+    "cheering", "retreating", "working", "asking", "solving",
+    "sitting", "cutting", "drying",
+]
 
 # Numarul de joints per human din Azure Kinect Body Tracking SDK
 # (folosit de MPHOI-72 conform paperului)
@@ -648,11 +654,7 @@ class MPHOI72ZarrDataset(Dataset):
     """
 
     NUM_CLASSES = 13
-    ACTIVITY_LABELS = [
-        "approaching", "lifting", "pouring", "placing", "drinking",
-        "cheering", "retreating", "working", "asking", "solving",
-        "sitting", "cutting", "drying",
-    ]
+    ACTIVITY_LABELS = MPHOI72_ACTIVITY_LABELS
 
     def __init__(
         self,

@@ -75,7 +75,6 @@ class Logger:
         if self.wandb_run is not None:
             log_dict = {f"loss/{name}": float(val) for name, val in losses.items()}
             self.wandb_run.log(log_dict, step=step)
-            self.log.info(f"  [W&B] Logged losses at step {step}: {list(log_dict.keys())}")
 
     def log_metrics(self, metrics: dict, epoch: int, split: str = "val") -> None:
         if self.writer is not None:
@@ -90,7 +89,6 @@ class Logger:
                 if not name.endswith("_std")
             }
             self.wandb_run.log(log_dict, step=epoch)
-            self.log.info(f"  [W&B] Logged metrics at step {epoch}: {list(log_dict.keys())}")
 
         self.log.info(
             f"Epoch {epoch} [{split}] | "

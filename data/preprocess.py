@@ -44,11 +44,6 @@ def get_imagenet_transform():
         T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
     ])
 
-def get_clip_transform(clip_preprocess):
-    """Wrapper peste preprocesarea nativa CLIP."""
-    return clip_preprocess
-
-
 # ---------------------------------------------------------------------------
 # Faster R-CNN cu ROI Pooling
 # ---------------------------------------------------------------------------
@@ -501,10 +496,9 @@ def preprocess_cad120(data_root: str, device: str) -> None:
     label_to_idx = {l: i for i, l in enumerate(CAD120Dataset.ACTIVITY_LABELS)}
 
     if not os.path.exists(raw_dir):
-        print(f"WARN: {raw_dir} nu exista. Creeaza structura de date mai intai.")
-        print("Genereaza date sintetice pentru test...")
-        _generate_synthetic_data(data_root, num_videos=20, num_classes=10)
-        return
+        raise FileNotFoundError(
+            f"{raw_dir} nu exista. Creeaza structura de date mai intai."
+        )
 
     for subject_name in sorted(os.listdir(raw_dir)):
         subject_path = os.path.join(raw_dir, subject_name)
@@ -542,55 +536,6 @@ def preprocess_cad120(data_root: str, device: str) -> None:
     preprocessor.generate_splits(video_ids_all, subject_ids, "leave_one_subject_out")
 
 
-def _generate_synthetic_data(data_root: str, num_videos: int = 20, num_classes: int = 10) -> None:
-    """
-    Genereaza date sintetice pentru testare fara date reale.
-    Utila pentru a verifica pipeline-ul inainte de a descarca dataset-urile.
-    """
-    print(f"Generare {num_videos} video-uri sintetice...")
-
-    features_dir = os.path.join(data_root, "features")
-    labels_dir   = os.path.join(data_root, "labels")
-    splits_dir   = os.path.join(data_root, "splits")
-
-    os.makedirs(features_dir, exist_ok=True)
-    os.makedirs(labels_dir, exist_ok=True)
-    os.makedirs(splits_dir, exist_ok=True)
-
-    S, M = 16, 3   # 16 frame-uri, 3 entitati per frame
-    N = S * M
-    video_ids = []
-
-    for i in range(num_videos):
-        vid_id = f"synthetic_{i:04d}"
-        label = i % num_classes
-
-        np.save(os.path.join(features_dir, f"{vid_id}_roi.npy"),
-                np.random.randn(S, M, 2048).astype(np.float32))
-        np.save(os.path.join(features_dir, f"{vid_id}_clip.npy"),
-                np.random.randn(S, M, 512).astype(np.float32))
-        np.save(os.path.join(labels_dir, f"{vid_id}_seg.npy"),
-                np.full(N, label, dtype=np.int64))
-        np.save(os.path.join(labels_dir, f"{vid_id}_frame.npy"),
-                np.full(N, label, dtype=np.int64))
-
-        video_ids.append(vid_id)
-
-    # Split simplu: 80% train, 20% test per fold (4 fold-uri)
-    for fold in range(4):
-        test_start = fold * (num_videos // 4)
-        test_end   = test_start + (num_videos // 4)
-        test_ids   = video_ids[test_start:test_end]
-        train_ids  = [v for v in video_ids if v not in test_ids]
-
-        with open(os.path.join(splits_dir, f"train_{fold}.txt"), "w") as f:
-            f.write("\n".join(train_ids))
-        with open(os.path.join(splits_dir, f"test_{fold}.txt"), "w") as f:
-            f.write("\n".join(test_ids))
-
-    print(f"Date sintetice generate in {data_root}")
-    print(f"  {num_videos} video-uri | S={S} frames | M={M} entitati | C={num_classes} clase")
-    print(f"  4 fold-uri generate in {splits_dir}/")
 
 
 # ---------------------------------------------------------------------------
@@ -630,5 +575,7 @@ if __name__ == "__main__":
     elif args.dataset == "cad120":
         preprocess_cad120(args.data_root, args.device)
     else:
-        print(f"Preprocessare pentru {args.dataset} - adapteaza structura din preprocess_cad120()")
-        print("Sau foloseste --synthetic pentru test rapid.")
+        raise NotImplementedError(
+            f"Preprocessare pentru {args.dataset} nu este implementata aici. "
+            f"Foloseste setup_mphoi72.py pentru MPHOI-72."
+        )

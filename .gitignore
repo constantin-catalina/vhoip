@@ -1,12 +1,10 @@
 venv/
 .env
 
-# Date brute (prea mari pentru git)
 data/mphoi72/
 data/cad120/
 data/bimanual/
 
-# Generate automat
 checkpoints/
 logs/
 outputs/
@@ -16,23 +14,20 @@ __pycache__/
 *.pyd
 .Python
 
-# Modele salvate
 *.pth
 *.pt
 *.ckpt
 
-# Jupyter
 .ipynb_checkpoints/
 *.ipynb_checkpoints
 
-# IDE
 .vscode/
 .idea/
 
-# OS
 .DS_Store
 Thumbs.db
 
 wandb/
 vhoip_features/
 tests/
+uml_output.txt

@@ -431,13 +431,13 @@ def main():
             model, train_loader, optimizer, criterion,
             scaler, device, logger, epoch, cfg,
         )
-        logger.log_losses(train_losses, epoch)
+        logger.log_losses(train_losses, epoch + 1)
         logger.info(f"  Train loss: {train_losses['total']:.4f}")
         if not use_plateau:
             scheduler.step()
 
         metrics = evaluate(model, val_loader, device, cfg.evaluation.iou_thresholds)
-        logger.log_metrics(metrics, epoch)
+        logger.log_metrics(metrics, epoch + 1)
 
         if use_plateau:
             scheduler.step(metrics["fsum"])
