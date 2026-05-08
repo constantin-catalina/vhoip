@@ -1,15 +1,17 @@
 # Script PowerShell pentru a rula antrenamentul pe toate fold-urile unui dataset
 # si a calcula automat FSUM mediu la final (ca in Tabelul 1 din paper).
 # Utilizare:
-#   .\scripts\run_all_folds.ps1                        # mphoi72, toate fold-urile
-#   .\scripts\run_all_folds.ps1 -Dataset cad120        # cad120, toate fold-urile
+#   .\scripts\run_all_folds.ps1                        # mphoi72, toate fold-urile, seed 42
+#   .\scripts\run_all_folds.ps1 -Dataset cad120        # cad120, toate fold-urile, seed 42
 #   .\scripts\run_all_folds.ps1 -Dataset mphoi72 -StartFold 2
+#   .\scripts\run_all_folds.ps1 -Dataset mphoi72 -Seed 123  # cu alt seed
 
 param(
     [Parameter(Mandatory)]
     [ValidateSet("mphoi72", "cad120", "bimanual")]
     [string]$Dataset,
-    [int]$StartFold = 0
+    [int]$StartFold = 0,
+    [int]$Seed = 42
 )
 
 $PYTHON_EXE = "c:\Users\Catalina\Desktop\Licenta\vhoip\venv\Scripts\python.exe"
@@ -50,6 +52,7 @@ for ($fold = $StartFold; $fold -lt $NUM_FOLDS; $fold++) {
     $output = & $PYTHON_EXE train.py `
         --config $CONFIG `
         --fold   $fold `
+        --seed   $Seed `
         --device cuda  2>&1
 
     # Afiseaza output-ul in timp real (il avem deja capturat, il printam)

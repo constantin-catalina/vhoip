@@ -319,6 +319,7 @@ def main():
         wandb_run_name = str(wandb_run_name).format(
             dataset=cfg.dataset.name,
             fold=args.fold,
+            seed=args.seed,
             experiment=experiment_name,
         )
 

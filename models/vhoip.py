@@ -321,7 +321,6 @@ class VHOIP(nn.Module):
                     subject=self._clip_subject,
                 )
                 self.T.copy_(T_final)
-            print("  C6b: T buffer updated with learned prompt features for inference.")
 
         self._inference_mode = inference
         if inference:
