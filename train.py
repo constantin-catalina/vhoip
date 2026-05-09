@@ -35,6 +35,7 @@ def parse_args():
     parser.add_argument("--wandb_project", type=str, default=None, help="Numele proiectului W&B")
     parser.add_argument("--wandb_entity", type=str, default=None, help="Entity/username W&B")
     parser.add_argument("--wandb_run_name", type=str, default=None, help="Nume custom pentru run-ul W&B")
+    parser.add_argument("--experiment_name", type=str, default=None, help="Nume experiment (subdirector checkpoints si W&B run name)")
     parser.add_argument(
         "--device",
         type=str,
@@ -291,16 +292,15 @@ def main():
 
     experiment_name = f"{cfg.dataset.name}_fold{args.fold}"
 
-    # Fiecare fold primeste propriul subdirector pentru checkpoints si logs.
-    # In plus, fiecare rulare primeste un ID unic (run_id) astfel incat
-    # reluari sau experimente multiple pe acelasi fold sa NU se suprascrie.
-    # Rezultat: checkpoints/mphoi72_fold0/<run_id>/best_model.pth
     run_id = generate_run_id()
+    exp_subdir = args.experiment_name or run_id
+
     base_checkpoint_dir = OmegaConf.select(cfg, "logging.checkpoint_dir", default="checkpoints/")
     base_log_dir = OmegaConf.select(cfg, "logging.log_dir", default="logs/")
-    OmegaConf.update(cfg, "logging.checkpoint_dir", os.path.join(base_checkpoint_dir, experiment_name, run_id))
-    OmegaConf.update(cfg, "logging.log_dir", os.path.join(base_log_dir, experiment_name, run_id))
+    OmegaConf.update(cfg, "logging.checkpoint_dir", os.path.join(base_checkpoint_dir, experiment_name, exp_subdir))
+    OmegaConf.update(cfg, "logging.log_dir", os.path.join(base_log_dir, experiment_name, exp_subdir))
     print(f"Run ID: {run_id}")
+    print(f"  Experiment:  {exp_subdir}")
     print(f"  Checkpoints: {cfg.logging.checkpoint_dir}")
     print(f"  Logs:        {cfg.logging.log_dir}")
 
@@ -320,7 +320,7 @@ def main():
             dataset=cfg.dataset.name,
             fold=args.fold,
             seed=args.seed,
-            experiment=experiment_name,
+            experiment_name=args.experiment_name or "default",
         )
 
     logger = Logger(
@@ -382,6 +382,8 @@ def main():
         cfg.training.lambda2,
         cfg.training.lambda3,
         lambda_ant=cfg.training.get("lambda_ant", 1.0),
+        seg_sigma=cfg.training.get("seg_sigma", 2.0),
+        seg_pos_weight=cfg.training.get("seg_pos_weight", 5.0),
     )
     scaler = torch.amp.GradScaler("cuda", enabled=cfg.training.use_amp and device.type == "cuda")
 
@@ -417,10 +419,10 @@ def main():
     logger.info("Incep antrenarea...")
     stage1_epochs = cfg.training.get("stage1_epochs", 5)
     for epoch in range(start_epoch, cfg.training.epochs):
-        # GSM temperature annealing: 1.0 -> 0.5 over stage 2
+        # GSM temperature annealing: 1.0 -> 0.7 over stage 2
         if epoch >= stage1_epochs:
             t = min((epoch - stage1_epochs) / max(cfg.training.epochs - stage1_epochs, 1), 1.0)
-            temp = 1.0 - 0.5 * t
+            temp = 1.0 - 0.3 * t
             model.backbone.set_gsm_temperature(temp)
 
         logger.info(
@@ -442,6 +444,18 @@ def main():
 
         if use_plateau:
             scheduler.step(metrics["fsum"])
+
+        # Save last checkpoint every epoch
+        save_checkpoint(
+            model,
+            optimizer,
+            epoch,
+            metrics,
+            cfg.logging.checkpoint_dir,
+            is_best=False,
+            save_last=True,
+            save_local=local_checkpoints_enabled,
+        )
 
         is_best = metrics["fsum"] > best_fsum
         if is_best:

@@ -71,9 +71,10 @@ def _gaussian_smooth_1d(x: torch.Tensor, sigma: float = 4.0) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 class SegmentationLoss(nn.Module):
-    def __init__(self, sigma: float = 4.0):
+    def __init__(self, sigma: float = 2.0, pos_weight: Optional[float] = None):
         super().__init__()
         self.sigma = sigma
+        self.pos_weight = pos_weight
 
     def forward(
         self,
@@ -90,9 +91,11 @@ class SegmentationLoss(nn.Module):
         valid_mask = (frame_labels != -1).float()
 
         u_logits = torch.logit(u_soft.float().clamp(1e-6, 1 - 1e-6))
+        pw = torch.tensor(self.pos_weight, device=u_logits.device) if self.pos_weight is not None else None
         bce_per_pos = F.binary_cross_entropy_with_logits(
             u_logits,
             boundary_smooth.float(),
+            pos_weight=pw,
             reduction='none',
         )
 
@@ -161,7 +164,8 @@ class VHOIPLoss(nn.Module):
         lambda3:     coeficient L_Cos  (default=0.5)
         lambda_ant:  coeficient L_Ant  (default=1.0)
         lambda4:     coeficient L_PromptReg (default=0.1, C6b anchor loss)
-        seg_sigma:   sigma filtru Gaussian pt L_Seg (default=4.0)
+        seg_sigma:   sigma filtru Gaussian pt L_Seg (default=2.0)
+        seg_pos_weight: pos_weight pt BCE L_Seg (default=5.0)
     """
 
     def __init__(
@@ -171,7 +175,8 @@ class VHOIPLoss(nn.Module):
         lambda3: float = 0.5,
         lambda_ant: float = 1.0,
         lambda4: float = 0.1,
-        seg_sigma: float = 4.0,
+        seg_sigma: float = 2.0,
+        seg_pos_weight: Optional[float] = 5.0,
     ):
         super().__init__()
         self.lambda1 = lambda1
@@ -181,7 +186,7 @@ class VHOIPLoss(nn.Module):
         self.lambda4 = lambda4
 
         self.l_label = nn.CrossEntropyLoss(ignore_index=-1, label_smoothing=0.1)
-        self.l_seg   = SegmentationLoss(sigma=seg_sigma)
+        self.l_seg   = SegmentationLoss(sigma=seg_sigma, pos_weight=seg_pos_weight)
         self.l_mi    = MutualInformationLoss()
         self.l_cos   = CosineSimilarityLoss()
 

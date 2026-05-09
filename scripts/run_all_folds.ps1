@@ -11,7 +11,8 @@ param(
     [ValidateSet("mphoi72", "cad120", "bimanual")]
     [string]$Dataset,
     [int]$StartFold = 0,
-    [int]$Seed = 42
+    [int]$Seed = 42,
+    [string]$ExperimentName = "default"
 )
 
 $PYTHON_EXE = "c:\Users\Catalina\Desktop\Licenta\vhoip\venv\Scripts\python.exe"
@@ -53,6 +54,7 @@ for ($fold = $StartFold; $fold -lt $NUM_FOLDS; $fold++) {
         --config $CONFIG `
         --fold   $fold `
         --seed   $Seed `
+        --experiment_name $ExperimentName `
         --device cuda  2>&1
 
     # Afiseaza output-ul in timp real (il avem deja capturat, il printam)

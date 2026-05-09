@@ -29,6 +29,10 @@ training:
   # Gradient clipping
   grad_clip: 0.5
 
+  # Segmentation loss (L_Seg) settings
+  seg_sigma: 2.0          # Gaussian kernel width for boundary smoothing
+  seg_pos_weight: 5.0     # BCE pos_weight for boundary class imbalance
+
 data:
   roi_dim: 2048                  # dimensiune ROI pooling Faster R-CNN
   num_workers: 2
@@ -40,11 +44,11 @@ evaluation:
 logging:
   log_dir: "logs/"
   checkpoint_dir: "checkpoints/"
-  save_every: 5                  
-  log_every: 10                  
-  local_logging_enabled: true    
-  local_checkpoints_enabled: true  
+  save_every: 5
+  log_every: 10
+  local_logging_enabled: false    # no TensorBoard files by default
+  local_checkpoints_enabled: true
   wandb_enabled: true
   wandb_project: "vhoip"
   wandb_entity: null
-  wandb_run_name: null
+  wandb_run_name: "{dataset}_{experiment_name}_fold{fold}_seed{seed}"
