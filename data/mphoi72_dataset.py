@@ -14,9 +14,13 @@ Structura asteptata in data_root/:
 
 Fisiere generate de convert_zarr_to_npy() in data_root/features/:
     <video_id>_roi.npy          (S, M, 2048)  - ROI pooling features
-    <video_id>_clip.npy         (S, M, 512)   - CLIP visual features (placeholder)
     <video_id>_geo.npy          (S, J, 4)     - geometric keypoints (pozitie+viteza)
     <video_id>_entity_types.npy (M,)          - 0=human, 1=object per entitate
+    <video_id>_bbox.npy         (S, M, 4)     - bounding boxes [x1,y1,x2,y2]
+
+CLIP visual features (_clip.npy) NU sunt generate de convert_zarr_to_npy().
+Se extrag separat din video-uri brute cu extract_clip_features_from_videos().
+Daca nu exista, modelul foloseste fallback text-based pentru G_init.
 
 Geometric features (geo) — format conform 2G-GCN §4.1:
     J = J_h * N_humans + 4 * N_objects
@@ -31,8 +35,13 @@ Entity types — indexare:
     0 = human, 1 = object
 
 Utilizare:
-    from data.mphoi72_dataset import MPHOI72ZarrDataset, convert_zarr_to_npy, prepare_mphoi72_splits
+    from data.mphoi72_dataset import (
+        MPHOI72ZarrDataset, convert_zarr_to_npy,
+        prepare_mphoi72_splits, extract_clip_features_from_videos,
+    )
     convert_zarr_to_npy('data/mphoi72/')
+    # Optional: extrage CLIP real din video-uri brute (necesita raw videos)
+    extract_clip_features_from_videos('data/mphoi72/', 'data/mphoi72/videos/')
     prepare_mphoi72_splits('data/mphoi72/')
     ds = MPHOI72ZarrDataset('data/mphoi72/', split='train', fold=0)
     sample = ds[0]
@@ -347,6 +356,61 @@ def _bbox_to_keypoints(bbox: np.ndarray, S: int) -> np.ndarray:
     return corners
 
 
+def _extract_bboxes(
+    hbox_store: Optional[zarr.Group],
+    obox_store: Optional[zarr.Group],
+    video_id: str,
+    S: int,
+    num_humans: int,
+    num_objects: int,
+) -> np.ndarray:
+    """
+    Extrage bounding boxes brute (x1, y1, x2, y2) per entitate per frame.
+    Ordinea: [Human1, Human2, ..., Object1, Object2, ...].
+
+    Returns:
+        bboxes: (S, M, 4) float32 — padding cu zerouri daca S difera
+    """
+    M = num_humans + num_objects
+    bboxes = np.zeros((S, M, 4), dtype=np.float32)
+
+    if hbox_store is not None and video_id in hbox_store:
+        hbox_data = hbox_store[video_id]
+        if hasattr(hbox_data, "keys"):
+            human_keys = sorted([k for k in hbox_data.keys()
+                                 if k.lower().startswith("human")])
+            for i, hk in enumerate(human_keys[:num_humans]):
+                arr = np.array(hbox_data[hk], dtype=np.float32)  # (S, 4)
+                if arr.ndim == 2:
+                    n = min(arr.shape[0], S)
+                    bboxes[:n, i] = arr[:n]
+        elif hasattr(hbox_data, "shape"):
+            arr = np.array(hbox_data, dtype=np.float32)
+            if arr.ndim == 3:
+                n = min(arr.shape[0], S)
+                for i in range(min(arr.shape[1], num_humans)):
+                    bboxes[:n, i] = arr[:n, i, :]
+
+    if obox_store is not None and video_id in obox_store:
+        obox_data = obox_store[video_id]
+        if hasattr(obox_data, "keys"):
+            obj_keys = sorted([k for k in obox_data.keys()
+                               if not k.lower().startswith("human")])
+            for i, ok in enumerate(obj_keys[:num_objects]):
+                arr = np.array(obox_data[ok], dtype=np.float32)  # (S, 4)
+                if arr.ndim == 2:
+                    n = min(arr.shape[0], S)
+                    bboxes[:n, num_humans + i] = arr[:n]
+        elif hasattr(obox_data, "shape"):
+            arr = np.array(obox_data, dtype=np.float32)
+            if arr.ndim == 3:
+                n = min(arr.shape[0], S)
+                for i in range(min(arr.shape[1], num_objects)):
+                    bboxes[:n, num_humans + i] = arr[:n, i, :]
+
+    return bboxes
+
+
 # ---------------------------------------------------------------------------
 # Convertor zarr -> numpy (pas intermediar, rulat O SINGURA DATA)
 # ---------------------------------------------------------------------------
@@ -354,7 +418,12 @@ def _bbox_to_keypoints(bbox: np.ndarray, S: int) -> np.ndarray:
 def convert_zarr_to_npy(data_root: str, output_dir: Optional[str] = None) -> List[str]:
     """
     Converteste features zarr in fisiere .npy compatibile cu pipeline-ul VHOIP.
-    Genereaza: _roi.npy, _clip.npy, _geo.npy, _entity_types.npy, _seg.npy, _frame.npy.
+    Genereaza: _roi.npy, _geo.npy, _entity_types.npy, _seg.npy, _frame.npy.
+    Bounding boxes sunt salvate ca _bbox.npy (necesare pentru extragerea
+    reala a features CLIP din crop-uri de imagini).
+
+    Fisierele _clip.npy NU sunt create aici — se extrag separat din video-uri
+    brute cu extract_clip_features_from_videos().
 
     Se ruleaza O SINGURA DATA (skip daca fisierele exista deja).
 
@@ -431,11 +500,14 @@ def convert_zarr_to_npy(data_root: str, output_dir: Optional[str] = None) -> Lis
             geo = np.zeros((S, J, GEO_FEAT_DIM), dtype=np.float32)
             entity_types = np.array([0] * num_humans + [1] * num_objects, dtype=np.int64)
 
+        # --- Bounding boxes (pentru extragerea CLIP din video-uri brute) ---
+        bboxes = _extract_bboxes(hbox_store, obox_store, video_id, S, num_humans, num_objects)
+
         # --- Salveaza ---
         np.save(roi_out_path,                                          roi_features.astype(np.float32))
-        np.save(os.path.join(features_out, f"{video_id}_clip.npy"),   np.zeros((S, M, 512), dtype=np.float32))
         np.save(os.path.join(features_out, f"{video_id}_geo.npy"),    geo)
         np.save(os.path.join(features_out, f"{video_id}_entity_types.npy"), entity_types)
+        np.save(os.path.join(features_out, f"{video_id}_bbox.npy"),   bboxes)
         np.save(os.path.join(labels_out,   f"{video_id}_seg.npy"),    seg_labels.astype(np.int64))
         np.save(os.path.join(labels_out,   f"{video_id}_frame.npy"),  frame_labels.astype(np.int64))
 
@@ -792,122 +864,154 @@ def collate_fn(batch: List[Dict]) -> Dict:
 
 
 # ---------------------------------------------------------------------------
-# CLIP Visual Feature Extraction (offline, run once before training)
+# CLIP Visual Feature Extraction din video-uri brute (conform paper §3.2)
 # ---------------------------------------------------------------------------
 
-def extract_clip_features(
+def extract_clip_features_from_videos(
     data_root: str,
+    videos_dir: str,
     model_name: str = "ViT-B/16",
     device: str = "cuda",
-    batch_size: int = 64,
     output_dir: Optional[str] = None,
 ) -> None:
     """
-    Extrage features CLIP vizuale pentru fiecare ROI si le salveaza ca _clip.npy,
-    inlocuind placeholder-urile de zerouri create de convert_zarr_to_npy().
+    Extrage features CLIP vizuale reale din crop-uri de imagini brute.
 
-    Trebuie apelata DUPA convert_zarr_to_npy() si INAINTE de antrenare.
-    Furnizeaza prior-ul CLIP real (G_init) modelului VHOIP.
+    Pentru fiecare video, citeste frame-urile din fisierul video,
+    decupeaza regiunile de interes folosind bounding boxes salvate,
+    si ruleaza crop-urile prin encoder-ul CLIP vizual real.
 
-    Deoarece nu avem imagini brute (doar ROI pooling 2048-dim), proiectam
-    features-urile ROI in spatiul intern al ViT-B/16 (768-dim) si rulam
-    transformer-ul CLIP pentru a obtine reprezentari in spatiul CLIP (512-dim).
-
-    IMPORTANT pentru dtype: CLIP se incarca in float16 pe CUDA si float32 pe CPU.
-    Toti tensorii nostri trebuie castati la dtype-ul CLIP inainte de forward pass.
+    Aceasta functie aliniaza codul cu paper-ul VHOIP §3.2, Fig. 2,
+    unde features CLIP vizuale sunt extrase din crop-uri reale,
+    nu prin proiectie artificiala a ROI pooling.
 
     Args:
-        data_root:  directorul radacina al MPHOI-72
+        data_root:  directorul radacina al MPHOI-72 (contine features/ si labels/)
+        videos_dir: directorul cu fisiere video brute (.mp4, .avi, etc.)
         model_name: modelul CLIP (default ViT-B/16, conform paper)
         device:     'cuda' sau 'cpu'
-        batch_size: numarul de entitati procesate simultan (reduce daca OOM)
         output_dir: directorul de output (default: data_root/features/)
     """
     try:
         import clip as clip_lib
-    except ImportError:
+        import cv2
+        from PIL import Image
+    except ImportError as e:
         raise ImportError(
-            "CLIP nu este instalat. Ruleaza:\n"
-            "  pip install git+https://github.com/openai/CLIP.git"
+            f"Dependente lipsa pentru extragerea CLIP: {e}. "
+            "Ruleaza: pip install git+https://github.com/openai/CLIP.git opencv-python Pillow"
         )
-
-    import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
 
     if output_dir is None:
         output_dir = os.path.join(data_root, "features")
-
-    print(f"\nIncarc CLIP {model_name} pe {device}...")
-    clip_model, _ = clip_lib.load(model_name, device=device)
-    clip_model.eval()
-    clip_dim = 512   # ViT-B/16 output dim
-
-    # Detectam dtype-ul real al modelului: float16 pe CUDA, float32 pe CPU.
-    clip_dtype = clip_model.visual.transformer.resblocks[0].attn.in_proj_weight.dtype
-    print(f"  CLIP dtype detectat: {clip_dtype}")
-
-    # Proiectie ROI (2048) -> spatiu intern ViT-B/16 (768-dim patch embedding).
-    # Initializare ortogonala in float32, recastata la clip_dtype.
-    roi_dim = 2048
-    vit_patch_dim = 768
-    proj = nn.Linear(roi_dim, vit_patch_dim, bias=False)
-    nn.init.orthogonal_(proj.weight)
-    proj = proj.to(device=device, dtype=clip_dtype)
+    os.makedirs(output_dir, exist_ok=True)
 
     features_dir = os.path.join(data_root, "features")
-    roi_files = sorted(f for f in os.listdir(features_dir) if f.endswith("_roi.npy"))
-    print(f"Procesez {len(roi_files)} video-uri...")
+    bbox_files = sorted(f for f in os.listdir(features_dir) if f.endswith("_bbox.npy"))
 
-    for roi_file in roi_files:
-        video_id = roi_file.replace("_roi.npy", "")
-        clip_out_path = os.path.join(output_dir, f"{video_id}_clip.npy")
-
-        roi = np.load(os.path.join(features_dir, roi_file))   # (S, M, 2048) float32
-        S, M, D = roi.shape
-
-        roi_tensor = torch.tensor(roi, device=device, dtype=clip_dtype)
-        roi_flat   = roi_tensor.reshape(S * M, D)              # (S*M, 2048)
-
-        clip_feats_list = []
-        visual = clip_model.visual
-
-        with torch.no_grad():
-            for i in range(0, S * M, batch_size):
-                batch_roi = roi_flat[i: i + batch_size]        # (b, 2048)
-
-                # Proiectare ROI -> patch embedding (768-dim)
-                patch_tokens = proj(batch_roi)                  # (b, 768)
-                patch_tokens = F.normalize(
-                    patch_tokens.float(), dim=-1
-                ).to(clip_dtype)
-
-                b = patch_tokens.shape[0]
-                num_patches = 196   # 224/16 * 224/16 = 196 pt ViT-B/16
-
-                # Replica token-ul pe toate pozitiile de patch
-                patch_seq = patch_tokens.unsqueeze(1).expand(b, num_patches, -1)
-                cls_tokens = visual.class_embedding.unsqueeze(0).expand(b, -1, -1)
-                x = torch.cat([cls_tokens, patch_seq], dim=1)   # (b, 197, 768)
-                x = x + visual.positional_embedding
-                x = visual.ln_pre(x)
-
-                x = x.permute(1, 0, 2).to(clip_dtype)           # (197, b, 768)
-                x = visual.transformer(x)
-                x = x.permute(1, 0, 2)                           # (b, 197, 768)
-                x = visual.ln_post(x[:, 0, :])                   # cls token: (b, 768)
-                if visual.proj is not None:
-                    x = x @ visual.proj                           # (b, 512)
-
-                feats = F.normalize(x.float(), dim=-1)            # (b, 512) float32
-                clip_feats_list.append(feats.cpu().numpy())
-
-        clip_feats = np.concatenate(clip_feats_list, axis=0)    # (S*M, 512)
-        clip_feats = clip_feats.reshape(S, M, clip_dim)          # (S, M, 512)
-        np.save(clip_out_path, clip_feats.astype(np.float32))
-        print(
-            f"  {video_id}: shape={clip_feats.shape}, "
-            f"norm_mean={np.linalg.norm(clip_feats, axis=-1).mean():.4f}"
+    if not bbox_files:
+        raise RuntimeError(
+            "Nu am gasit fisiere _bbox.npy in features/. "
+            "Ruleaza mai intai convert_zarr_to_npy() pentru a genera bounding boxes."
         )
 
-    print(f"\nCLIP features salvate in {output_dir}/ ({len(roi_files)} video-uri).")
+    print(f"\nIncarc CLIP {model_name} pe {device}...")
+    clip_model, clip_preprocess = clip_lib.load(model_name, device=device)
+    clip_model.eval()
+    clip_dtype = clip_model.visual.transformer.resblocks[0].attn.in_proj_weight.dtype
+    print(f"  CLIP incarcat (dtype: {clip_dtype}).")
+
+    # Mapare video_id -> path video
+    video_exts = (".mp4", ".avi", ".mov", ".mkv")
+    video_files = {}
+    for root, dirs, files in os.walk(videos_dir):
+        for f in files:
+            if f.lower().endswith(video_exts):
+                vid_id = os.path.splitext(f)[0]
+                video_files[vid_id] = os.path.join(root, f)
+
+    processed, skipped, missing_video = 0, 0, 0
+
+    for bbox_file in bbox_files:
+        video_id = bbox_file.replace("_bbox.npy", "")
+        clip_out_path = os.path.join(output_dir, f"{video_id}_clip.npy")
+
+        if os.path.exists(clip_out_path):
+            skipped += 1
+            continue
+
+        # Load bounding boxes
+        bboxes = np.load(os.path.join(features_dir, bbox_file))  # (S, M, 4)
+        S, M, _ = bboxes.shape
+
+        # Cauta fisier video (case-insensitive)
+        video_path = video_files.get(video_id)
+        if video_path is None:
+            for vid_id, path in video_files.items():
+                if vid_id.lower() == video_id.lower():
+                    video_path = path
+                    break
+
+        if video_path is None or not os.path.exists(video_path):
+            print(f"  [SKIP] {video_id}: nu am gasit video in {videos_dir}")
+            missing_video += 1
+            continue
+
+        # Citeste frame-uri
+        from data.preprocess import VideoReader
+        reader = VideoReader(video_path)
+        frames = reader.read_frames()
+
+        if not frames:
+            print(f"  [SKIP] {video_id}: nu am putut citi frame-uri")
+            missing_video += 1
+            continue
+
+        n_frames = len(frames)
+        if n_frames != S:
+            print(f"  [WARN] {video_id}: video are {n_frames} frame-uri, bbox are {S}. Folosesc min.")
+            n = min(n_frames, S)
+            frames = frames[:n]
+            bboxes = bboxes[:n]
+            S = n
+
+        # Extrage CLIP din crop-uri reale
+        clip_all = np.zeros((S, M, 512), dtype=np.float32)
+
+        with torch.no_grad():
+            for s in range(S):
+                frame_bgr = frames[s]
+                H, W = frame_bgr.shape[:2]
+                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
+                crops = []
+                for m in range(M):
+                    x1, y1, x2, y2 = bboxes[s, m]
+
+                    # Verifica daca box-ul e valid
+                    if x2 - x1 < 1 or y2 - y1 < 1:
+                        crop = frame_rgb
+                    else:
+                        x1, y1 = max(0, int(x1)), max(0, int(y1))
+                        x2, y2 = min(W, int(x2)), min(H, int(y2))
+                        crop = frame_rgb[y1:y2, x1:x2]
+                        if crop.size == 0:
+                            crop = frame_rgb
+
+                    pil_crop = Image.fromarray(crop)
+                    crops.append(clip_preprocess(pil_crop))
+
+                if crops:
+                    crops_tensor = torch.stack(crops).to(device=device, dtype=clip_dtype)
+                    feats = clip_model.encode_image(crops_tensor)  # (M, 512)
+                    feats = torch.nn.functional.normalize(feats.float(), dim=-1)
+                    clip_all[s] = feats.cpu().numpy()
+
+        np.save(clip_out_path, clip_all.astype(np.float32))
+        print(
+            f"  {video_id}: shape={clip_all.shape}, "
+            f"norm_mean={np.linalg.norm(clip_all, axis=-1).mean():.4f}"
+        )
+        processed += 1
+
+    print(f"\nCLIP features extrase: {processed} video-uri, {skipped} skip, {missing_video} fara video.")

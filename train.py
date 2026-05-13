@@ -181,10 +181,10 @@ def initialize_global_representation(model, dataloader, device, logger):
     """
     Initializeaza G din prototipurile CLIP vizuale pe setul de train.
 
-    IMPORTANT: clip_features trebuie sa fie extrase real cu CLIPVisualEncoder
-    inainte de antrenare (via setup_mphoi72.py sau un script separat).
-    Daca fisierele _clip.npy contin zerouri (placeholder), G_init va fi
-    zero si beneficiul prior-ului CLIP va fi pierdut.
+    IMPORTANT: clip_features trebuie sa fie extrase real cu CLIP din crop-uri
+    de imagini brute inainte de antrenare (via extract_clip_features_from_videos()
+    din data/mphoi72_dataset.py). Daca fisierele _clip.npy lipsesc sau contin
+    zerouri, fallback-ul la text-based G_init este automat.
     """
     clip_features_all = []
     labels_all = []
@@ -219,7 +219,7 @@ def initialize_global_representation(model, dataloader, device, logger):
         logger.info(
             f"  clip_features norm medie: {feature_norm:.4f} (placeholder/invalid).\n"
             f"  Fallback: G initializat din text features T (CLIP text encoder).\n"
-            f"  Pentru CLIP vizual real, ruleaza extract_clip_features() din mphoi72_dataset.py."
+            f"  Pentru CLIP vizual real, ruleaza extract_clip_features_from_videos() din data/mphoi72_dataset.py."
         )
         model.initialize_G_from_text()
         return
@@ -393,11 +393,10 @@ def main():
         start_epoch = ckpt["epoch"] + 1
         best_fsum = ckpt["metrics"].get("fsum", 0.0)
         logger.info(f"Resuming din epoch {start_epoch}, best FSUM={best_fsum:.1f}")
-        # G buffer-ul a fost restaurat din checkpoint via state_dict().
-        # _initialized este un atribut Python simplu (nu tensor/buffer), deci
-        # nu se salveaza/restaureaza automat — trebuie setat manual dupa resume.
-        model.global_rep._initialized = True
-        logger.info("G marcat ca initializat (restaurat din checkpoint).")
+        # G si _initialized_flag sunt salvate/restaurate automat via state_dict().
+        # _check_initialized() in update() sincronizeaza flag-ul cu G pentru
+        # backward compatibility cu checkpoint-uri vechi.
+        logger.info("G si flag-ul de initializare restaurate din checkpoint.")
 
         # Reset scheduler so Stage 2 gets its own full cycle
         stage2_epochs = cfg.training.epochs - start_epoch

@@ -10,7 +10,7 @@ from data.mphoi72_dataset import (
     collate_fn,
     convert_zarr_to_npy,
     prepare_mphoi72_splits,
-    extract_clip_features,
+    extract_clip_features_from_videos,
     load_action_mapping,
     load_ground_truth,
 )

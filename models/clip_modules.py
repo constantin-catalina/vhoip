@@ -518,24 +518,21 @@ class IntegratedGlobalRepresentation(nn.Module):
             torch.zeros(num_classes, feature_dim)
         )
         self.prototyping = Prototyping(num_classes, feature_dim)
+        # Flag explicit ca buffer pentru robustete la save/load checkpoint.
+        self.register_buffer("_initialized_flag", torch.tensor(False))
 
-    @property
-    def _initialized(self) -> bool:
-        return bool(self.G.norm().item() > 0)
-
-    @_initialized.setter
-    def _initialized(self, value: bool) -> None:
-        if value and not bool(self.G.norm().item() > 0):
-            import warnings
-            warnings.warn(
-                "S-a setat _initialized=True dar G este inca zero. "
-                "Asigura-te ca initialize() sau load_checkpoint() a fost apelat corect.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+    def _check_initialized(self) -> None:
+        """
+        Sincronizeaza flag-ul cu buffer-ul G (backward-compatible).
+        Daca un checkpoint vechi a incarcat G dar nu avea _initialized_flag,
+        detecteaza automat si seteaza flag-ul corect.
+        """
+        if not self._initialized_flag.item() and self.G.norm().item() > 0:
+            self._initialized_flag = torch.tensor(True)
 
     def initialize(self, g_init: torch.Tensor) -> None:
         self.G.copy_(g_init)
+        self._initialized_flag = torch.tensor(True)
         print(f"  G initializat cu prototipuri CLIP (shape: {g_init.shape})")
 
     @torch.no_grad()
@@ -545,7 +542,8 @@ class IntegratedGlobalRepresentation(nn.Module):
         labels: torch.Tensor,
         epoch: int,
     ) -> None:
-        if not self._initialized:
+        self._check_initialized()
+        if not self._initialized_flag.item():
             raise RuntimeError("Apeleaza initialize() cu G_init inainte de update().")
 
         valid_mask = ~torch.isnan(collected_features).any(dim=-1)
