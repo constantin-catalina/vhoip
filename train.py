@@ -484,6 +484,12 @@ def main():
     logger.log_summary({"best_fsum": best_fsum, "fold": args.fold})
     logger.close()
 
+    # Elibereaza memoria GPU intre fold-uri (util cand rulezi toate fold-urile secvential)
+    if args.device == "cuda" and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        import gc
+        gc.collect()
+
 
 if __name__ == "__main__":
     main()

@@ -13,10 +13,20 @@ def build_checkpoint_state(
     optimizer: torch.optim.Optimizer,
     epoch: int,
     metrics: dict,
+    save_frozen: bool = False,
 ) -> dict:
+    if save_frozen:
+        model_state = model.state_dict()
+    else:
+        # Only save trainable params + buffers (excludes frozen CLIP, saves ~500 MB)
+        trainable_names = {name for name, p in model.named_parameters() if p.requires_grad}
+        model_state = {
+            k: v for k, v in model.state_dict().items()
+            if k in trainable_names or not k.endswith(('.weight', '.bias'))
+        }
     return {
         "epoch": epoch,
-        "model_state_dict": model.state_dict(),
+        "model_state_dict": model_state,
         "optimizer_state_dict": optimizer.state_dict(),
         "metrics": metrics,
     }
@@ -62,7 +72,12 @@ def load_checkpoint(
     device: str = "cuda",
 ) -> dict:
     checkpoint = torch.load(path, map_location=device, weights_only=False)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    # strict=False allows loading partial state dicts (e.g. without frozen CLIP weights)
+    missing, unexpected = model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+    if missing:
+        print(f"  [INFO] Chei lipsa in checkpoint (parametri frozen, initializati la valori default): {len(missing)}")
+    if unexpected:
+        print(f"  [WARN] Chei neasteptate in checkpoint: {unexpected}")
 
     if optimizer and "optimizer_state_dict" in checkpoint:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
