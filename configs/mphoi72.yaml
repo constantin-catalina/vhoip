@@ -18,12 +18,5 @@ training:
   epochs: 50
   batch_size: 1
   stage1_epochs: 3
-  stage2_epochs: 47
-  lambda1_start: 0.1
-  lambda1_final: 1.0
-
-  # Tuned loss weights: strengthen text prior (lambda3), weaken MI (lambda2)
-  lambda2: 0.3
-  lambda3: 0.7
 
   scheduler: "cosine"

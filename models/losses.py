@@ -270,14 +270,12 @@ class VHOIPLoss(nn.Module):
         lambda1: float = 1.0,
         lambda2: float = 0.5,
         lambda3: float = 0.5,
-        lambda_ant: float = 1.0,
         seg_sigma: float = 4.0,
     ):
         super().__init__()
         self.lambda1 = lambda1
         self.lambda2 = lambda2
         self.lambda3 = lambda3
-        self.lambda_ant = lambda_ant
 
         self.l_label = nn.CrossEntropyLoss(ignore_index=-1)
         self.l_seg   = SegmentationLoss(sigma=seg_sigma)
@@ -293,7 +291,6 @@ class VHOIPLoss(nn.Module):
         cos_similarities:    torch.Tensor,           # (B, N, C)
         segment_labels:      torch.Tensor,           # (B, N)     — etichete segment (-1=ignorat)
         frame_labels:        torch.Tensor,           # (B, N)     — etichete frame (-1=ignorat)
-        anticipation_labels: Optional[torch.Tensor] = None,  # (B, N) — segment_labels shifted by 1
         training_stage:      int = 2,
     ) -> dict:
         """
@@ -309,18 +306,6 @@ class VHOIPLoss(nn.Module):
             segment_labels.reshape(B * N),
         )
 
-        # L_Anticipation: predict label of NEXT segment (ASSIGN Appendix B)
-        # Identical to L_Label but targets are segment_labels shifted one step forward.
-        # The caller builds anticipation_labels as torch.roll(seg_labels, -1, dim=1)
-        # with the last column set to -1 (ignored by CrossEntropyLoss).
-        if anticipation_labels is not None:
-            l_ant = self.l_label(
-                segment_logits.reshape(B * N, C),
-                anticipation_labels.reshape(B * N),
-            )
-        else:
-            l_ant = torch.tensor(0.0, device=segment_logits.device)
-
         # L_Seg: BCE pe boundary signal (ASSIGN Eq. 11)
         # Activ doar la Stage 2; Stage 1 returneaza 0
         l_seg = self.l_seg(u_soft, frame_labels, training_stage)
@@ -333,7 +318,6 @@ class VHOIPLoss(nn.Module):
 
         total = (
             l_label
-            + self.lambda_ant * l_ant
             + self.lambda1 * l_seg
             + self.lambda2 * l_mi
             + self.lambda3 * l_cos
@@ -342,7 +326,6 @@ class VHOIPLoss(nn.Module):
         return {
             "total":   total,
             "l_label": l_label.detach(),
-            "l_ant":   l_ant.detach(),
             "l_seg":   l_seg.detach() if isinstance(l_seg, torch.Tensor) else l_seg,
             "l_mi":    l_mi.detach(),
             "l_cos":   l_cos.detach(),

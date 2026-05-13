@@ -91,20 +91,8 @@ def train_one_epoch(model, dataloader, optimizer, criterion, scaler, device, log
     stage1_epochs = cfg.training.get("stage1_epochs", 10)
     current_stage = 1 if epoch < stage1_epochs else 2
 
-    # Ramp L_Seg weight linearly from lambda1_start to lambda1_final
-    # over stage2 epochs, to avoid the sudden loss spike at transition
-    if current_stage == 1:
-        lambda1 = 0.0
-    else:
-        lambda1_start = cfg.training.get("lambda1_start", 0.1)
-        lambda1_final = cfg.training.get("lambda1_final", cfg.training.lambda1)
-        ramp_epochs   = cfg.training.get("stage2_epochs", 40)
-        stage2_epoch  = epoch - stage1_epochs          # 0-indexed within stage 2
-        t             = min(stage2_epoch / ramp_epochs, 1.0)
-        lambda1       = lambda1_start + t * (lambda1_final - lambda1_start)
-
-    # Update criterion's lambda1 dynamically
-    criterion.lambda1 = lambda1
+    # Stage 1: L_Seg off (lambda1=0); Stage 2: L_Seg on (lambda1 din config)
+    criterion.lambda1 = 0.0 if current_stage == 1 else cfg.training.lambda1
 
     for batch_idx, batch in enumerate(dataloader):
         roi = batch["roi_features"].to(device)
@@ -114,11 +102,6 @@ def train_one_epoch(model, dataloader, optimizer, criterion, scaler, device, log
         frame_labels = batch["frame_labels"].to(device)
 
         optimizer.zero_grad()
-
-        # Build anticipation labels: segment_labels shifted one step forward in time.
-        # ant_labels[b, t] = seg_labels[b, t+1]; last position is set to -1 (ignored).
-        ant_labels = seg_labels.roll(-1, dims=1)
-        ant_labels[:, -1] = -1
 
         with torch.amp.autocast(
             device_type=device.type,
@@ -139,7 +122,6 @@ def train_one_epoch(model, dataloader, optimizer, criterion, scaler, device, log
                 cos_similarities=outputs["cos_similarities"],
                 segment_labels=seg_labels,
                 frame_labels=frame_labels,
-                anticipation_labels=ant_labels,
                 training_stage=current_stage,
             )
 
@@ -165,7 +147,6 @@ def train_one_epoch(model, dataloader, optimizer, criterion, scaler, device, log
             logger.info(
                 f"  [{batch_idx}/{len(dataloader)}] "
                 f"Loss={losses['total'].item():.4f} "
-                f"Ant={losses['l_ant'].item():.4f} "
                 f"MI={losses['l_mi'].item():.4f} "
                 f"Cos={losses['l_cos'].item():.4f} "
                 f"GradNorm={grad_norm:.2f}"
@@ -229,7 +210,15 @@ def initialize_global_representation(model, dataloader, device, logger):
 
 
 def _frames_to_segments(frame_labels):
-    """Group consecutive frames with the same class label into (start, end, class) segments."""
+    """Group consecutive frames with the same class label into (start, end, class) segments.
+
+    Strips trailing -1 padding frames so they do not create spurious GT segments.
+    """
+    if not frame_labels:
+        return []
+    # Strip trailing -1 padding
+    while frame_labels and frame_labels[-1] == -1:
+        frame_labels = frame_labels[:-1]
     if not frame_labels:
         return []
     segments = []
@@ -380,7 +369,6 @@ def main():
         cfg.training.lambda1,
         cfg.training.lambda2,
         cfg.training.lambda3,
-        lambda_ant=cfg.training.get("lambda_ant", 1.0),
     )
     scaler = torch.amp.GradScaler("cuda", enabled=cfg.training.use_amp and device.type == "cuda")
 
@@ -415,16 +403,7 @@ def main():
     logger.info("Incep antrenarea...")
     stage1_epochs = cfg.training.get("stage1_epochs", 5)
     for epoch in range(start_epoch, cfg.training.epochs):
-        # GSM temperature annealing: 1.0 -> 0.7 over stage 2
-        if epoch >= stage1_epochs:
-            t = min((epoch - stage1_epochs) / max(cfg.training.epochs - stage1_epochs, 1), 1.0)
-            temp = 1.0 - 0.3 * t
-            model.backbone.set_gsm_temperature(temp)
-
-        logger.info(
-            f"\nEpoch {epoch + 1}/{cfg.training.epochs}  "
-            f"(GSM temp={model.backbone.boundary_detector.temperature:.3f})"
-        )
+        logger.info(f"\nEpoch {epoch + 1}/{cfg.training.epochs}")
 
         train_losses = train_one_epoch(
             model, train_loader, optimizer, criterion,

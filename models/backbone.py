@@ -93,7 +93,7 @@ class GeometricLevelGCN(nn.Module):
 class FusionLevelGraph(nn.Module):
     """
     Fuziune features vizuale + geometrice.
-    Geometry->object: inclus. Geometry->human: exclus (ablation Table 4).
+    Geometry->object: inclus. Geometry->human: inclus (conform paper 2G-GCN).
     """
 
     def __init__(self, visual_dim: int = 256, geo_dim: int = 128,
@@ -117,12 +117,6 @@ class FusionLevelGraph(nn.Module):
         else:
             all_keys = v
         scores = torch.bmm(v, all_keys.transpose(1, 2)) / self.scale
-        if geo_out is not None and entity_types is not None:
-            B, M, _ = visual.shape
-            J    = geo_out.shape[1]
-            mask = torch.zeros(B, M, M + J, dtype=torch.bool, device=visual.device)
-            mask[:, :, M:] = (entity_types == 0).unsqueeze(2).expand(B, M, J)
-            scores = scores.masked_fill(mask, float('-inf'))
         weights = self.dropout(torch.softmax(scores, dim=-1))
         return self.norm(torch.bmm(weights, all_keys) + v)
 
@@ -395,11 +389,11 @@ class SegmentLevelLayer(nn.Module):
         ], dim=-1)        # (B, M, S, 5D)
 
         # BiRNNs per entitate  (Eq. 9)
-        # IMPORTANT: BiRNN vede TOATE frame-urile (fara zero-masking).
-        # u_hard gateaza doar clasificatorul per frame (segment logits),
-        # nu inputul BiRNN — conform ASSIGN §3.4 care updateaza selectiv
-        # starea h_s, dar lasa BiRNN sa proceseze contextul complet.
+        # Zero-masking la frame-urile cu u_hard=0 pentru a aproxima
+        # update-ul sparse din ASSIGN §3.4 (offline-compatible).
         z_flat = z.reshape(B * M, S, -1)
+        u_hard_flat = u_hard.reshape(B * M, S).unsqueeze(-1)   # (B*M, S, 1)
+        z_flat = z_flat * u_hard_flat                         # zero where u=0
         h_s_flat, _ = self.birnn(z_flat)            # (B*M, S, D)
         h_s_flat    = self.dropout(h_s_flat)
         h_s         = h_s_flat.reshape(B, M, S, D)
@@ -465,14 +459,7 @@ class Backbone2GGCN(nn.Module):
         self.fusion_graph = FusionLevelGraph(input_dim, C2, hidden_dim, dropout)
         self.msg_passing  = SpatialMessagePassing()
 
-        # Proiectia lui x^e_t la D (pentru concatenare cu h^e_{t,f} in detector)
-        self.x_proj = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-        )
-
-        # Detector: input = [x(D); h_f(D); m_intra(2D); m_inter(2D)] = 6D
+        # Detector: input = [x_fused(D); h_f(D); m_intra(2D); m_inter(2D)] = 6D
         self.boundary_detector = SegmentBoundaryDetector(
             input_dim=6 * hidden_dim,
             temperature=gsm_temp,
@@ -480,10 +467,6 @@ class Backbone2GGCN(nn.Module):
         )
 
         self.segment_layer = SegmentLevelLayer(hidden_dim, num_classes, num_layers, dropout)
-
-    def set_gsm_temperature(self, temp: float) -> None:
-        """Ajusteaza temperatura Gumbel-Softmax (scade pe parcursul training-ului)."""
-        self.boundary_detector.temperature = temp
 
     def forward(
         self,
@@ -537,8 +520,10 @@ class Backbone2GGCN(nn.Module):
         # h_f_fused = h_f (fusion deja aplicat la input BiRNN)
         h_f_fused = h_f
 
-        # ---- 3. Proiectia x^e_t  (pentru detector) ----
-        x_proj_bms = self.x_proj(roi_features).permute(0, 2, 1, 3)   # (B, M, S, D)
+        # ---- 3. x^e_t = enriched frame representation (dupa fusion) ----
+        # Conform ASSIGN Eq. 5, detectorul primeste x^e_t imbogatit (fused),
+        # nu ROI brut.
+        x_proj_bms = x_fused  # (B, M, S, D) — deja proiectat de FusionLevelGraph
 
         # ---- 4. Spatial Message Passing per frame  (Eq. 2–4) ----
         m_inter_f_list, m_intra_f_list = [], []
@@ -558,9 +543,9 @@ class Backbone2GGCN(nn.Module):
             u_hard_bms = torch.ones(B, M, S, device=device)
         else:
             # Stage 2: Gumbel-Softmax
-            # Input: [x(D); h_f(D); m_intra(2D); m_inter(2D)] = 6D
+            # Input: [x_fused(D); h_f(D); m_intra(2D); m_inter(2D)] = 6D
             det_in = torch.cat([
-                x_proj_bms,   # (B, M, S, D)
+                x_proj_bms,   # (B, M, S, D) — fused features
                 h_f_fused,    # (B, M, S, D)
                 m_intra_f,    # (B, M, S, 2D)
                 m_inter_f,    # (B, M, S, 2D)

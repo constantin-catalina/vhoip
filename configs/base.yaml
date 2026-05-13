@@ -15,7 +15,6 @@ training:
   lambda1: 1.0                   # L_Seg
   lambda2: 0.5                   # L_MI
   lambda3: 0.5                   # L_Cos
-  lambda_ant: 1.0                # L_Anticipation
 
   # EMA
   rho: 0.9
