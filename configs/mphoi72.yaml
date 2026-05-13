@@ -4,9 +4,9 @@ defaults:
 dataset:
   name: "mphoi72"
   root: "data/mphoi72/"
-  num_classes: 13               
+  num_classes: 13
   num_subjects: 12
-  cross_validation: "two_subject_out"   
+  cross_validation: "two_subject_out"
 
   clip_subject: "person"
   clip_template: "A photo of a person {verb}"
@@ -17,18 +17,13 @@ model:
 training:
   epochs: 50
   batch_size: 1
-  stage1_epochs: 5
-  stage2_epochs: 50
-  lambda1_start: 0.1  
-  lambda1_final: 1.0     
+  stage1_epochs: 3
+  stage2_epochs: 47
+  lambda1_start: 0.1
+  lambda1_final: 1.0
 
-  scheduler: "plateau"        
-  scheduler_patience: 5       
-  scheduler_factor: 0.5       
+  # Tuned loss weights: strengthen text prior (lambda3), weaken MI (lambda2)
+  lambda2: 0.3
+  lambda3: 0.7
 
-logging:
-  wandb_enabled: true
-  wandb_project: "vhoip"
-  wandb_run_name: "{dataset}_fold{fold}"
-  local_logging_enabled: false    
-  local_checkpoints_enabled: true
+  scheduler: "cosine"

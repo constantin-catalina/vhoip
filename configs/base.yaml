@@ -7,7 +7,7 @@ model:
 
 training:
   epochs: 50
-  batch_size: 4                  
+  batch_size: 4
   learning_rate: 1.0e-3
   warmup_epochs: 5               # epoci pentru warmup
 
@@ -18,7 +18,7 @@ training:
   lambda_ant: 1.0                # L_Anticipation
 
   # EMA
-  rho: 0.9                       
+  rho: 0.9
 
   # Mixed precision
   use_amp: false
@@ -37,11 +37,10 @@ evaluation:
 logging:
   log_dir: "logs/"
   checkpoint_dir: "checkpoints/"
-  save_every: 5                  
-  log_every: 10                  
-  local_logging_enabled: true    
-  local_checkpoints_enabled: true  
+  log_every: 10
+  local_logging_enabled: false    # no TensorBoard files by default
+  local_checkpoints_enabled: true
   wandb_enabled: true
   wandb_project: "vhoip"
   wandb_entity: null
-  wandb_run_name: null
+  wandb_run_name: "{dataset}_{experiment_name}_fold{fold}_seed{seed}"
