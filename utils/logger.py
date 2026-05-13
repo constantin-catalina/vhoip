@@ -5,6 +5,7 @@ Logging in terminal si TensorBoard.
 
 import os
 import logging
+from typing import Optional
 from torch.utils.tensorboard import SummaryWriter
 
 try:

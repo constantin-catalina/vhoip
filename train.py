@@ -141,7 +141,6 @@ def train_one_epoch(model, dataloader, optimizer, criterion, scaler, device, log
                 frame_labels=frame_labels,
                 anticipation_labels=ant_labels,
                 training_stage=current_stage,
-                prompt_reg_loss=outputs.get("prompt_reg_loss"),
             )
 
         if torch.isnan(losses["total"]) or torch.isinf(losses["total"]):
@@ -382,8 +381,6 @@ def main():
         cfg.training.lambda2,
         cfg.training.lambda3,
         lambda_ant=cfg.training.get("lambda_ant", 1.0),
-        seg_sigma=cfg.training.get("seg_sigma", 2.0),
-        seg_pos_weight=cfg.training.get("seg_pos_weight", 5.0),
     )
     scaler = torch.amp.GradScaler("cuda", enabled=cfg.training.use_amp and device.type == "cuda")
 
