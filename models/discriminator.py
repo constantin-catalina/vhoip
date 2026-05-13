@@ -67,19 +67,25 @@ class Discriminator(nn.Module):
 
         # -----------------------------------------------------------------------
         # Bratul global: sigma1(g_k) -> MLP
-        # Ordinea din Eq. 1: INTAI sigmoid, APOI MLP
+        # Ordinea din Eq. 1: INTAI sigmoid, APOI MLP (cu hidden layer)
         # -----------------------------------------------------------------------
         self.global_branch = nn.Sequential(
             nn.Sigmoid(),                          # sigma1 din Eq. 1
-            nn.Linear(global_dim, mlp_dim),        # MLP
+            nn.Linear(global_dim, mlp_dim),        # MLP hidden
+            nn.ReLU(),
+            nn.Linear(mlp_dim, mlp_dim),           # MLP output
         )
 
         # -----------------------------------------------------------------------
         # Bratul local: ||z_i||_2 -> sigma2 -> MLP
         # L2-normalizarea este aplicata in forward() inainte de acest branch.
         # -----------------------------------------------------------------------
-        self.prelu = nn.PReLU()                    # sigma2 din Eq. 1
-        self.local_mlp = nn.Linear(feature_dim, mlp_dim)
+        self.local_branch = nn.Sequential(
+            nn.PReLU(),                            # sigma2 din Eq. 1
+            nn.Linear(feature_dim, mlp_dim),       # MLP hidden
+            nn.ReLU(),
+            nn.Linear(mlp_dim, mlp_dim),           # MLP output
+        )
 
     def forward(
         self,
@@ -116,17 +122,14 @@ class Discriminator(nn.Module):
         # -----------------------------------------------------------------------
         z_norm = F.normalize(z, p=2, dim=-1)       # (B, N, feature_dim)
 
-        # Pas 2: PReLU (sigma2)
-        z_activated = self.prelu(z_norm)            # (B, N, feature_dim)
-
-        # Pas 3: MLP
-        h_z = self.local_mlp(z_activated)           # (B, N, mlp_dim)
+        # Pas 2+3: PReLU (sigma2) + MLP
+        h_z = self.local_branch(z_norm)             # (B, N, mlp_dim)
 
         # -----------------------------------------------------------------------
         # Bratul global (Eq. 1: sigma1(g_k) -> MLP)
         # G: (C, global_dim) — trebuie extins la (1, C, mlp_dim) pentru broadcasting
         # -----------------------------------------------------------------------
-        # self.global_branch: Sigmoid -> Linear
+        # self.global_branch: Sigmoid -> Linear -> ReLU -> Linear
         # Input: (C, global_dim), Output: (C, mlp_dim)
         h_g = self.global_branch(G)                 # (C, mlp_dim)
 

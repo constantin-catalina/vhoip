@@ -6,6 +6,7 @@ Utilizare:
     python train.py --config configs/cad120.yaml
     python train.py --config configs/cad120.yaml --fold 0
     python train.py --config configs/mphoi72.yaml --fold 0 --resume checkpoints/epoch_010.pth
+    python train.py --config configs/mphoi72.yaml --fold 0 --override "training.seg_sigma=4.0" --override "training.lambda2=0.5"
 """
 
 import argparse
@@ -36,6 +37,12 @@ def parse_args():
     parser.add_argument("--wandb_entity", type=str, default=None, help="Entity/username W&B")
     parser.add_argument("--wandb_run_name", type=str, default=None, help="Nume custom pentru run-ul W&B")
     parser.add_argument("--experiment_name", type=str, default=None, help="Nume experiment (subdirector checkpoints si W&B run name)")
+    parser.add_argument(
+        "--override",
+        action="append",
+        default=None,
+        help="Override config value (format: key=value, e.g., training.seg_sigma=4.0)",
+    )
     parser.add_argument(
         "--device",
         type=str,
@@ -280,6 +287,37 @@ def evaluate(model, dataloader, device, iou_thresholds):
     return compute_metrics_epoch(all_preds, all_gts, iou_thresholds)
 
 
+def _parse_override_value(v: str):
+    """Parseaaza valoarea string in int, float, bool, None sau string."""
+    try:
+        return int(v)
+    except ValueError:
+        try:
+            return float(v)
+        except ValueError:
+            low = v.lower()
+            if low == "true":
+                return True
+            elif low == "false":
+                return False
+            elif low in ("none", "null"):
+                return None
+            return v
+
+
+def apply_overrides(cfg, overrides: list):
+    """Aplica override-uri CLI pe config OmegaConf."""
+    if not overrides:
+        return
+    for override in overrides:
+        if "=" not in override:
+            raise ValueError(f"Override invalid (lipseste '='): {override}")
+        key, value_str = override.split("=", 1)
+        value = _parse_override_value(value_str)
+        OmegaConf.update(cfg, key, value)
+        print(f"  [override] {key} = {value}")
+
+
 def main():
     args = parse_args()
     set_seed(args.seed)
@@ -289,6 +327,10 @@ def main():
         OmegaConf.load("configs/base.yaml"),
         OmegaConf.load(args.config),
     )
+
+    if args.override:
+        print("Aplic override-uri CLI:")
+        apply_overrides(cfg, args.override)
 
     experiment_name = f"{cfg.dataset.name}_fold{args.fold}"
 
