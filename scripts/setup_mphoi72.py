@@ -23,11 +23,14 @@ Utilizare:
     # si _extract_labels() din data/mphoi72_dataset.py
 """
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent.resolve()))
+
 import argparse
 import os
 import json
 import numpy as np
-import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 

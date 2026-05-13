@@ -1,6 +1,6 @@
 """
 utils/visualize.py
-Vizualizare rezultate segmentare temporala (similar cu Fig. 3 din paper).
+Vizualizare rezultate segmentare temporala.
 """
 
 import numpy as np

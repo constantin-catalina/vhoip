@@ -1,4 +1,8 @@
-# quick_viz.py
+# plot_test_videos.py
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent.resolve()))
+
 import torch
 import numpy as np
 import argparse
@@ -7,7 +11,7 @@ from omegaconf import OmegaConf
 from data.mphoi72_dataset import MPHOI72ZarrDataset, collate_fn
 from torch.utils.data import DataLoader
 from models.vhoip import VHOIP
-from utils.visualize import plot_segmentation, plot_multi_segmentation
+from utils.segmentation_plots import plot_segmentation, plot_multi_segmentation
 from data.dataset import MPHOI72Dataset
 
 def parse_args():
