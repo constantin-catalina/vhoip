@@ -252,31 +252,17 @@ class IntegratedGlobalRepresentation(nn.Module):
             torch.zeros(num_classes, feature_dim)
         )
         self.prototyping = Prototyping(num_classes, feature_dim)
-        # NOTA: _initialized NU mai este stocat ca atribut Python simplu.
-        # Este derivat din buffer-ul G (vezi property de mai jos), astfel incat
-        # starea este intotdeauna corecta dupa save/load checkpoint.
+        # Flag explicit ca buffer pentru robustete la save/load checkpoint.
+        self.register_buffer("_initialized_flag", torch.tensor(False))
 
-    @property
-    def _initialized(self) -> bool:
+    def _check_initialized(self) -> None:
         """
-        Returneaza True daca G a fost initializat cu valori non-zero.
-        Derivat din buffer-ul G, deci corect si dupa resume din checkpoint.
+        Sincronizeaza flag-ul cu buffer-ul G (backward-compatible).
+        Daca un checkpoint vechi a incarcat G dar nu avea _initialized_flag,
+        detecteaza automat si seteaza flag-ul corect.
         """
-        return bool(self.G.norm().item() > 0)
-
-    @_initialized.setter
-    def _initialized(self, value: bool) -> None:
-        # Setter no-op: permite cod extern (ex. train.py) sa seteze flag-ul
-        # fara a ridica eroare, dar starea reala ramane derivata din G.
-        # Daca value=True si G e zero, inseamna o eroare logica upstream.
-        if value and not bool(self.G.norm().item() > 0):
-            import warnings
-            warnings.warn(
-                "S-a setat _initialized=True dar G este inca zero. "
-                "Asigura-te ca initialize() sau load_checkpoint() a fost apelat corect.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+        if not self._initialized_flag.item() and self.G.norm().item() > 0:
+            self._initialized_flag = torch.tensor(True)
 
     def initialize(self, g_init: torch.Tensor) -> None:
         """
@@ -287,7 +273,7 @@ class IntegratedGlobalRepresentation(nn.Module):
             g_init: (C, feature_dim) - prototipuri CLIP
         """
         self.G.copy_(g_init)
-        # _initialized este acum derivat din G — nu mai trebuie setat manual.
+        self._initialized_flag = torch.tensor(True)
         print(f"  G initializat cu prototipuri CLIP (shape: {g_init.shape})")
 
     @torch.no_grad()
@@ -306,7 +292,8 @@ class IntegratedGlobalRepresentation(nn.Module):
             labels:             (N_total,) - etichetele corespunzatoare
             epoch:              epoch curent
         """
-        if not self._initialized:
+        self._check_initialized()
+        if not self._initialized_flag.item():
             raise RuntimeError("Apeleaza initialize() cu G_init inainte de update().")
 
         # Filtreaza features NaN inainte de prototyping.

@@ -137,12 +137,18 @@ class FrameLevelBiRNN(nn.Module):
     def __init__(self, input_dim: int = 2048, hidden_dim: int = 256,
                  num_classes: int = 10, num_layers: int = 2, dropout: float = 0.3):
         super().__init__()
-        self.input_proj = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-        )
+        # Dupa FusionLevelGraph, inputul este deja hidden_dim.
+        # Proiectia este necesara doar cand inputul brut (ex. 2048-dim ROI)
+        # ajunge direct in BiRNN.
+        if input_dim != hidden_dim:
+            self.input_proj = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+            )
+        else:
+            self.input_proj = nn.Identity()
         self.birnn = nn.GRU(
             input_size=hidden_dim,
             hidden_size=hidden_dim // 2,
@@ -452,7 +458,8 @@ class Backbone2GGCN(nn.Module):
         self.num_classes = num_classes
 
         self.geo_gcn   = GeometricLevelGCN(geo_input_dim, C1, C2)
-        self.frame_birnn = FrameLevelBiRNN(input_dim, hidden_dim, num_classes, num_layers, dropout)
+        # Dupa FusionLevelGraph, inputul BiRNN este hidden_dim (nu 2048 brut).
+        self.frame_birnn = FrameLevelBiRNN(hidden_dim, hidden_dim, num_classes, num_layers, dropout)
         # FusionLevelGraph primeste ROI brut (input_dim=2048) si produce hidden_dim.
         # Conform 2G-GCN Fig. 3: fusion se aplica INAINTE de BiRNN.
         self.fusion_graph = FusionLevelGraph(input_dim, C2, hidden_dim, dropout)
@@ -519,12 +526,8 @@ class Backbone2GGCN(nn.Module):
         x_fused = torch.stack(x_fused_list, dim=2)   # (B, M, S, D)
 
         # ---- 2. Frame-level BiRNN pe features imbogatite  (ASSIGN §3.3, Eq. 1) ----
-        # Input este deja D-dim dupa fusion, deci sarim input_proj din FrameLevelBiRNN
-        # si folosim direct sub-modulele birnn + dropout + frame_classifier.
         x_bm = x_fused.reshape(B * M, S, self.hidden_dim)
-        z_bm, _ = self.frame_birnn.birnn(x_bm)
-        z_bm     = self.frame_birnn.dropout(z_bm)
-        fl_bm    = self.frame_birnn.frame_classifier(z_bm)
+        z_bm, fl_bm = self.frame_birnn(x_bm)
         h_f      = z_bm.reshape(B, M, S, self.hidden_dim)    # (B, M, S, D)
         fl_4d    = fl_bm.reshape(B, M, S, self.num_classes)  # frame logits 4D
 
