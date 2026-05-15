@@ -1,3 +1,4 @@
+
 model:
   clip_model: "ViT-B/16"         # encoder CLIP folosit
   clip_dim: 512                  # dimensiune feature CLIP

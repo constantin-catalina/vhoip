@@ -237,9 +237,23 @@ def initialize_global_representation(model, dataloader, device, logger):
 
 
 def _frames_to_segments(frame_labels):
-    """Group consecutive frames with the same class label into (start, end, class) segments."""
+    """Group consecutive frames with the same class label into (start, end, class) segments.
+
+    Filters out padding values (-1) which are used to pad shorter videos to max length."""
     if not frame_labels:
         return []
+
+    # Truncate at the first padding frame (-1) since padding only occurs at the tail end.
+    valid_len = len(frame_labels)
+    for i, label in enumerate(frame_labels):
+        if label == -1:
+            valid_len = i
+            break
+
+    frame_labels = frame_labels[:valid_len]
+    if not frame_labels:
+        return []
+
     segments = []
     start = 0
     for i in range(1, len(frame_labels)):
@@ -424,6 +438,7 @@ def main():
         cfg.training.lambda2,
         cfg.training.lambda3,
         lambda_ant=cfg.training.get("lambda_ant", 1.0),
+        lambda4=cfg.training.get("lambda4", 0.1),
         seg_sigma=cfg.training.get("seg_sigma", 2.0),
         seg_pos_weight=cfg.training.get("seg_pos_weight", 5.0),
     )

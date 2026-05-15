@@ -69,6 +69,7 @@ class VHOIP(nn.Module):
         self.hidden_dim = cfg.model.hidden_dim
         self.clip_dim = cfg.model.clip_dim
         self.use_learnable_prompts = getattr(cfg.model, "use_learnable_prompts", False)
+        self.disable_geo_branch = getattr(cfg.model, "disable_geo_branch", False)
 
         # -----------------------------------------------------------------------
         # Backbone 2G-GCN (geometric GCN + fusion graph + BiRNN)
@@ -208,6 +209,8 @@ class VHOIP(nn.Module):
         # -----------------------------------------------------------------------
         # Pas 1: Backbone 2G-GCN + ASSIGN
         # -----------------------------------------------------------------------
+        if self.disable_geo_branch:
+            geo_features = None
         backbone_out = self.backbone(
             roi_features=roi_features,
             geo_features=geo_features,
