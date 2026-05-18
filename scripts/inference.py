@@ -2,36 +2,29 @@
 inference.py
 Script pentru inferenta VHOIP pe imagini sau video.
 
-Extrage automat:
-  - ROI features (2048-dim) cu Faster R-CNN
-  - Keypoints geometrice cu MediaPipe Pose (umani) + bbox corners (obiecte)
-  - Tipuri entitati (human=0, object=1) din label-urile Faster R-CNN
+Moduri de functionare:
 
-Suporta ensemble peste toate fold-urile de cross-validare.
+1) --video-id (recomandat pentru dataset-ul MPHOI-72):
+   Incarca features pre-extrase din fisierele .npy (aceleasi folosite la training).
+   Elimina mismatch-urile intre pipeline-ul de training si cel de inferenta.
 
-Utilizare:
-    # Single checkpoint
+    python inference.py --config configs/mphoi72.yaml \
+                        --video-id Subject12-task_1_cheering-take_0 \
+                        --data-root data/mphoi72/ \
+                        --checkpoint_pattern "checkpoints/mphoi72_fold{fold}/w/o_L_Ant/best_model.pth" \
+                        --num_folds 28 --output results.json
+
+2) --input (inferenta pe video noi, cu extragere live):
+   Extrage automat ROI features (Faster R-CNN), keypoints (MediaPipe)
+   si entity types din detectii. ATENTIE: rezultatele pot diferi fata de
+   training din cauza mismatch-urilor de distributie a features.
+
     python inference.py --config configs/mphoi72.yaml \
                         --checkpoint checkpoints/best_model.pth \
                         --input path/to/video.mp4 \
-                        --output results.json \
-                        --visualize
+                        --output results.json --visualize
 
-    # Ensemble peste 28 fold-uri (MPHOI-72)
-    python inference.py --config configs/mphoi72.yaml \
-                        --checkpoint_pattern "checkpoints/mphoi72_fold{fold}/best_model.pth" \
-                        --num_folds 28 \
-                        --input path/to/video.mp4 \
-                        --output results.json \
-                        --visualize
-
-    # Director cu imagini
-    python inference.py --config configs/mphoi72.yaml \
-                        --checkpoint checkpoints/best_model.pth \
-                        --input path/to/frames/ \
-                        --output results.json
-
-Dependinte suplimentare:
+Dependinte suplimentare (doar pentru modul --input):
     pip install mediapipe
 """
 
@@ -72,28 +65,50 @@ from utils.video_annotation import (
 
 class MediaPipeExtractor:
     """
-    Extrage keypoints umane (33 landmarks) cu MediaPipe Pose per entitate.
+    Extrage keypoints umane (33 landmarks) cu MediaPipe PoseLandmarker per entitate.
     Se ruleaza pe crop-urile individuale detectate de Faster R-CNN.
+    Foloseste API-ul MediaPipe Tasks (nou, inlocuieste mp.solutions).
     """
 
     NUM_LANDMARKS = 33
 
     def __init__(self, static_image_mode: bool = False):
         try:
-            import mediapipe as mp
+            from mediapipe.tasks.python.vision import PoseLandmarker, PoseLandmarkerOptions
+            from mediapipe.tasks.python.core.base_options import BaseOptions
+            from mediapipe.tasks.python.vision import RunningMode
         except ImportError:
             raise ImportError(
-                "MediaPipe nu este instalat. Ruleaza:\n"
-                "  pip install mediapipe"
+                "MediaPipe nu este instalat sau versiunea nu suporta Tasks API. Ruleaza:\n"
+                "  pip install mediapipe>=0.10.0"
             )
 
-        self.mp_pose = mp.solutions.pose
-        self.pose = self.mp_pose.Pose(
-            static_image_mode=static_image_mode,
-            model_complexity=1,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
+        model_url = (
+            "https://storage.googleapis.com/mediapipe-models/"
+            "pose_landmarker/pose_landmarker_heavy/float16/latest/"
+            "pose_landmarker_heavy.task"
         )
+        model_path = os.path.join(
+            os.path.dirname(__file__), "..", "pose_landmarker_heavy.task"
+        )
+        model_path = os.path.abspath(model_path)
+
+        if not os.path.exists(model_path):
+            print(f"Descarc model MediaPipe Pose: {model_path} ...")
+            import urllib.request
+            os.makedirs(os.path.dirname(model_path), exist_ok=True)
+            urllib.request.urlretrieve(model_url, model_path)
+            print("Model descarcata.")
+
+        base_options = BaseOptions(model_asset_path=model_path)
+        options = PoseLandmarkerOptions(
+            base_options=base_options,
+            running_mode=RunningMode.IMAGE,
+            num_poses=1,
+            min_pose_detection_confidence=0.5,
+            min_pose_presence_confidence=0.5,
+        )
+        self.landmarker = PoseLandmarker.create_from_options(options)
 
     def extract(self, frame_bgr: np.ndarray, box: np.ndarray) -> Optional[np.ndarray]:
         """
@@ -117,14 +132,17 @@ class MediaPipeExtractor:
         if crop.size == 0:
             return None
 
+        from mediapipe import Image, ImageFormat
         rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-        results = self.pose.process(rgb)
+        mp_image = Image(image_format=ImageFormat.SRGB, data=rgb)
 
-        if not results.pose_landmarks:
+        result = self.landmarker.detect(mp_image)
+
+        if not result.pose_landmarks:
             return None
 
         landmarks = []
-        for lm in results.pose_landmarks.landmark:
+        for lm in result.pose_landmarks[0]:
             px = lm.x * (x2 - x1) + x1
             py = lm.y * (y2 - y1) + y1
             landmarks.append([px, py])
@@ -132,7 +150,7 @@ class MediaPipeExtractor:
         return np.array(landmarks, dtype=np.float32)  # (33, 2)
 
     def close(self):
-        self.pose.close()
+        self.landmarker.close()
 
 
 # ---------------------------------------------------------------------------
@@ -480,6 +498,79 @@ def ensemble_inference(
 
 
 # ---------------------------------------------------------------------------
+# Incarcare features pre-extrase din dataset (identic cu training)
+# ---------------------------------------------------------------------------
+
+def load_preextracted_features(
+    video_id: str,
+    data_root: str,
+    clip_dim: int = 512,
+) -> Dict[str, torch.Tensor]:
+    """
+    Incarca features pre-extrase din fisierele .npy generate de convert_zarr_to_npy().
+    Acesta este acelasi pipeline folosit la training, eliminand mismatch-urile.
+
+    Returns:
+        dict cu: roi_features (1,S,M,2048), geo_features (1,S,J,4),
+                 entity_types (1,M), clip_features (1,S,M,512),
+                 bboxes (S,M,4)
+    """
+    feat_dir  = os.path.join(data_root, "features")
+    label_dir = os.path.join(data_root, "labels")
+
+    # ROI features
+    roi_path = os.path.join(feat_dir, f"{video_id}_roi.npy")
+    if not os.path.exists(roi_path):
+        raise FileNotFoundError(f"ROI features nu exista: {roi_path}")
+    roi = np.load(roi_path).astype(np.float32)  # (S, M, 2048)
+
+    # Geometric features
+    geo_path = os.path.join(feat_dir, f"{video_id}_geo.npy")
+    if os.path.exists(geo_path):
+        geo = np.load(geo_path).astype(np.float32)  # (S, J, 4)
+    else:
+        S, M = roi.shape[:2]
+        J = 2 * 32 + (M - 2) * 4  # 2 humans * 32 joints + objects * 4 corners
+        geo = np.zeros((S, J, 4), dtype=np.float32)
+
+    # Entity types
+    etypes_path = os.path.join(feat_dir, f"{video_id}_entity_types.npy")
+    if os.path.exists(etypes_path):
+        entity_types = np.load(etypes_path).astype(np.int64)  # (M,)
+    else:
+        M = roi.shape[1]
+        entity_types = np.array([0, 0] + [1] * (M - 2), dtype=np.int64)
+
+    # CLIP features (optional)
+    clip_path = os.path.join(feat_dir, f"{video_id}_clip.npy")
+    if os.path.exists(clip_path):
+        clip = np.load(clip_path).astype(np.float32)  # (S, M, 512)
+    else:
+        clip = np.zeros((roi.shape[0], roi.shape[1], clip_dim), dtype=np.float32)
+
+    # Bounding boxes (optional, pentru vizualizare)
+    bbox_path = os.path.join(feat_dir, f"{video_id}_bbox.npy")
+    bboxes = None
+    if os.path.exists(bbox_path):
+        bboxes = np.load(bbox_path).astype(np.float32)  # (S, M, 4)
+
+    # Ground truth labels (optional, pentru comparare)
+    seg_path = os.path.join(label_dir, f"{video_id}_seg.npy")
+    gt_labels = None
+    if os.path.exists(seg_path):
+        gt_labels = np.load(seg_path).astype(np.int64)  # (N,)
+
+    return {
+        "roi_features":  torch.FloatTensor(roi).unsqueeze(0),     # (1, S, M, 2048)
+        "geo_features":  torch.FloatTensor(geo).unsqueeze(0),      # (1, S, J, 4)
+        "entity_types":  torch.LongTensor(entity_types).unsqueeze(0),  # (1, M)
+        "clip_features": torch.FloatTensor(clip).unsqueeze(0),     # (1, S, M, 512)
+        "bboxes":        bboxes,   # (S, M, 4) numpy, optional
+        "gt_labels":     gt_labels, # (N,) numpy, optional
+    }
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -491,7 +582,14 @@ def parse_args():
                         help="Pattern cu {fold} pentru ensemble, ex: checkpoints/fold{fold}/best.pth")
     parser.add_argument("--num-folds", type=int, default=28,
                         help="Numar fold-uri pentru ensemble (default 28 pentru MPHOI-72)")
-    parser.add_argument("--input", type=str, required=True, help="Path video sau director imagini")
+    # Input: unul din --video-id sau --input este obligatoriu
+    parser.add_argument("--video-id", type=str, default=None,
+                        help="Video ID din dataset (ex: Subject12-task_1_cheering-take_0). "
+                             "Incarca features pre-extrase din data-root, identic cu training.")
+    parser.add_argument("--data-root", type=str, default="data/mphoi72/",
+                        help="Directorul radacina al dataset-ului (folosit cu --video-id)")
+    parser.add_argument("--input", type=str, default=None,
+                        help="Path video sau director imagini (extragere live, nu recomandat)")
     parser.add_argument("--output", type=str, default="inference_results.json", help="Fisier output JSON")
     parser.add_argument("--visualize", action="store_true", help="Genereaza video annotat + timeline PNG")
     parser.add_argument("--video-out", type=str, default=None,
@@ -512,8 +610,12 @@ def main():
     device = torch.device(args.device)
 
     # Validare args
+    if args.video_id is None and args.input is None:
+        raise ValueError("Specifica --video-id (recomandat) sau --input.")
+    if args.video_id and args.input:
+        raise ValueError("Specifica doar unul din --video-id sau --input, nu ambele.")
     if args.checkpoint is None and args.checkpoint_pattern is None:
-        raise ValueError("Specifica --checkpoint sau --checkpoint-pattern (nu ambele).")
+        raise ValueError("Specifica --checkpoint sau --checkpoint-pattern.")
     if args.checkpoint is not None and args.checkpoint_pattern is not None:
         print("[WARN] Ambele --checkpoint si --checkpoint-pattern specificate. Folosesc --checkpoint-pattern.")
 
@@ -526,30 +628,56 @@ def main():
     label_names = get_label_names(dataset_name)
 
     print(f"Dataset: {dataset_name} | Clase: {label_names}")
-    print(f"Input: {args.input}")
     print(f"Device: {device}")
 
-    # Extrage features
-    print("\n[1/3] Extragere features ROI + geometrie...")
-    roi_features, geo_features, entity_types, boxes_all, frames = extract_features(
-        args.input,
-        device=str(device),
-        max_entities=args.max_entities,
-        max_frames=args.max_frames,
-    )
-    roi_features = roi_features.to(device)
-    geo_features = geo_features.to(device)
-    entity_types = entity_types.to(device)
+    # -----------------------------------------------------------------------
+    # Incarcare features
+    # -----------------------------------------------------------------------
+    boxes_all = None  # pentru vizualizare (doar modul --input)
+    frames = None     # pentru vizualizare (doar modul --input)
+
+    if args.video_id:
+        # Mod RECOMANDAT: features pre-extrase din dataset (identic cu training)
+        print(f"\n[1/3] Incarcare features pre-extrase pentru: {args.video_id}")
+        data = load_preextracted_features(
+            args.video_id, args.data_root, clip_dim=cfg.model.clip_dim,
+        )
+        roi_features  = data["roi_features"].to(device)
+        geo_features  = data["geo_features"].to(device)
+        entity_types   = data["entity_types"].to(device)
+        clip_features  = data["clip_features"].to(device)
+        gt_labels      = data["gt_labels"]
+        input_label    = args.video_id
+    else:
+        # Mod live: extragere cu Faster R-CNN + MediaPipe (poate avea mismatch-uri)
+        print(f"\n[1/3] Extragere features ROI + geometrie (live)...")
+        print("[WARN] Modul live poate produce rezultate diferite fata de training din cauza mismatch-urilor.")
+        roi, geo, etypes, boxes_all, frames = extract_features(
+            args.input,
+            device=str(device),
+            max_entities=args.max_entities,
+            max_frames=args.max_frames,
+        )
+        roi_features = roi.to(device)
+        geo_features = geo.to(device)
+        entity_types  = etypes.to(device)
+        clip_features = None
+        gt_labels      = None
+        input_label    = args.input
 
     print(f"  ROI: {roi_features.shape}")
     print(f"  Geo: {geo_features.shape}")
     print(f"  Entity types: {entity_types.tolist()}")
 
-    # Incarca model
+    # -----------------------------------------------------------------------
+    # Incarcare model
+    # -----------------------------------------------------------------------
     print("\n[2/3] Incarcare model...")
     model = VHOIP(cfg, label_names, device=str(device)).to(device)
 
+    # -----------------------------------------------------------------------
     # Inferenta — single sau ensemble
+    # -----------------------------------------------------------------------
     print("\n[3/3] Inferenta...")
     if args.checkpoint_pattern:
         segment_logits = ensemble_inference(
@@ -567,7 +695,9 @@ def main():
             )
             segment_logits = out["segment_logits"]
 
+    # -----------------------------------------------------------------------
     # Decodare
+    # -----------------------------------------------------------------------
     pred_classes = segment_logits.argmax(dim=-1).squeeze(0).cpu().numpy()  # (N,)
     B, N, C = segment_logits.shape
     M = entity_types.shape[1]
@@ -577,14 +707,33 @@ def main():
 
     predictions_json = decode_predictions(segment_logits, label_names, entity_types)
 
-    # Salveaza JSON
+    # -----------------------------------------------------------------------
+    # Rezultate
+    # -----------------------------------------------------------------------
     result = {
-        "input": args.input,
+        "input": input_label,
         "dataset": dataset_name,
-        "num_frames": len(frames),
-        "num_entities": args.max_entities,
+        "num_frames": int(S),
+        "num_entities": int(M),
         "predictions": predictions_json,
     }
+
+    # Comparare cu ground truth daca e disponibil
+    if gt_labels is not None:
+        pred_flat = pred_classes.flatten()[:len(gt_labels)]
+        gt_flat = gt_labels[:len(pred_flat)]
+        acc = np.mean(pred_flat == gt_flat)
+        result["ground_truth_accuracy"] = float(acc)
+        print(f"\n  Ground truth accuracy: {acc:.2%}")
+
+        # Per-class accuracy
+        print("\n  Per-class comparison:")
+        for cls_idx, cls_name in enumerate(label_names):
+            mask = gt_flat == cls_idx
+            if mask.sum() > 0:
+                cls_acc = np.mean(pred_flat[mask] == cls_idx)
+                print(f"    {cls_name:<20}: {cls_acc:.2%} ({mask.sum()} samples)")
+
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
     print(f"\nRezultate salvate in: {args.output}")
@@ -604,8 +753,8 @@ def main():
             pct = count / pred_classes.size * 100
             print(f"  {cls_name:<20} {'#' * int(pct/2):<25} {pct:.1f}%")
 
-    # Vizualizare
-    if args.visualize:
+    # Vizualizare (doar modul --input)
+    if args.visualize and frames is not None and boxes_all is not None:
         print("\n[4/4] Generare vizualizare...")
         video_out = args.video_out or args.output.replace(".json", ".mp4")
         if video_out == args.output:
@@ -613,7 +762,6 @@ def main():
 
         save_visualization_video(frames, boxes_all, pred_classes, label_names, video_out, fps=args.fps)
 
-        # Salvare raw data pentru re-vizualizare
         raw_path = args.output.replace(".json", "_raw.npz")
         save_raw_data_npz(raw_path, frames, boxes_all, pred_classes, entity_types.cpu().numpy())
 
