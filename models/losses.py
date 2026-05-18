@@ -173,7 +173,7 @@ class VHOIPLoss(nn.Module):
         lambda1: float = 1.0,
         lambda2: float = 0.5,
         lambda3: float = 0.5,
-        lambda_ant: float = 1.0,
+        lambda_ant: float = 0.0,
         lambda4: float = 0.1,
         seg_sigma: float = 2.0,
         seg_pos_weight: Optional[float] = 5.0,
