@@ -281,6 +281,9 @@ def _extract_geo_features(
     # Concateneaza toti keypoints: (S, J_total, 2)
     all_positions = np.concatenate(keypoint_sequences, axis=1)  # (S, J, 2)
 
+    # Inlocuieste NaN-uri (cadre unde Kinect nu a detectat skeleton-ul)
+    all_positions = np.nan_to_num(all_positions, nan=0.0)
+
     # Viteza = diferenta pozitie fata de frame-ul anterior
     velocities = np.zeros_like(all_positions)                    # (S, J, 2)
     velocities[1:] = all_positions[1:] - all_positions[:-1]     # frame[t] - frame[t-1]
