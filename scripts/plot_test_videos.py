@@ -1,4 +1,3 @@
-# plot_test_videos.py
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.resolve()))
@@ -42,7 +41,11 @@ def main():
     print(f"Loading checkpoint: {args.checkpoint}")
     model = VHOIP(cfg, label_names, device=str(device)).to(device)
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["model_state_dict"])
+    missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    if missing:
+        print(f"  [INFO] Missing keys (frozen params, initialized from pretrained): {len(missing)}")
+    if unexpected:
+        print(f"  [WARN] Unexpected keys: {len(unexpected)}")
     model.set_inference_mode(True)
     print(f"  Loaded from epoch {ckpt['epoch']} | "
           f"FSUM={ckpt['metrics'].get('fsum', 0):.1f}")
