@@ -135,7 +135,7 @@ def train_one_epoch(model, dataloader, optimizer, criterion, scaler, device, log
         scaler.scale(losses["total"]).backward()
         scaler.unscale_(optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(
-            list(model.parameters()) + list(criterion.parameters()),
+            model.parameters(),
             max_norm=cfg.training.grad_clip
         )
         scaler.step(optimizer)
@@ -359,8 +359,7 @@ def main():
         cfg.training.lambda3,
     )
     optimizer = torch.optim.Adam(
-        [p for p in model.parameters() if p.requires_grad]
-        + [p for p in criterion.parameters() if p.requires_grad],
+        [p for p in model.parameters() if p.requires_grad],
         lr=cfg.training.learning_rate,
     )
     if cfg.training.get("scheduler", "cosine") == "plateau":
@@ -376,7 +375,7 @@ def main():
 
     start_epoch, best_fsum = 0, 0.0
     if args.resume:
-        ckpt = load_checkpoint(args.resume, model, optimizer, str(device), criterion=criterion)
+        ckpt = load_checkpoint(args.resume, model, optimizer, str(device))
         start_epoch = ckpt["epoch"] + 1
         best_fsum = ckpt["metrics"].get("fsum", 0.0)
         logger.info(f"Resuming din epoch {start_epoch}, best FSUM={best_fsum:.1f}")
@@ -429,7 +428,6 @@ def main():
             epoch,
             metrics,
             cfg.logging.checkpoint_dir,
-            criterion=criterion,
             is_best=False,
             save_last=True,
             save_local=local_checkpoints_enabled,
@@ -444,7 +442,6 @@ def main():
                 epoch,
                 metrics,
                 cfg.logging.checkpoint_dir,
-                criterion=criterion,
                 is_best=True,
                 save_local=local_checkpoints_enabled,
             )

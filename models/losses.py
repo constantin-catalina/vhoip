@@ -216,17 +216,12 @@ class CosineSimilarityLoss(nn.Module):
     """
     L_Cos — Cosine similarity loss (VHOIP Eq. 3).
 
-    CE intre similaritatile cosinus Z' vs T si etichetele reale,
-    cu temperature scaling (similar cu CLIP).
-    Fara temperature, cosine similarity in [-1, 1] produce softmax aproape
-    uniform pentru C=13 clase, gradient foarte slab.
+    CE intre similaritatile cosinus Z' vs T si etichetele reale.
+    Conform paperului, similaritatile cosinus brute sunt folosite direct.
     """
 
-    def __init__(self, init_logit_scale: float = 4.6):
+    def __init__(self):
         super().__init__()
-        # Temperature scaling parameter (similar CLIP): logit_scale = log(tau)
-        # CLIP initializeaza la log(1/0.07) ~= 4.6; inv_tau = exp(4.6) ~= 100
-        self.logit_scale = nn.Parameter(torch.ones([]) * init_logit_scale)
         self.ce = nn.CrossEntropyLoss(ignore_index=-1)
 
     def forward(self, similarities: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -241,12 +236,7 @@ class CosineSimilarityLoss(nn.Module):
             B, N, C = similarities.shape
             similarities = similarities.reshape(B * N, C)
             labels       = labels.reshape(B * N)
-
-        # Scale cosine similarities by learnable temperature
-        scale = self.logit_scale.exp().clamp(max=100.0)
-        scaled_similarities = similarities * scale
-
-        return self.ce(scaled_similarities, labels)
+        return self.ce(similarities, labels)
 
 
 # ---------------------------------------------------------------------------

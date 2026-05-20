@@ -92,8 +92,14 @@ class GeometricLevelGCN(nn.Module):
 
 class FusionLevelGraph(nn.Module):
     """
-    Fuziune features vizuale + geometrice.
-    Geometry->object: inclus. Geometry->human: inclus (conform paper 2G-GCN).
+    Fuziune features vizuale + geometrice (2G-GCN §4.3, Eq. 4).
+
+    Conform paperului: "connecting the geometry-object pairs consistently
+    performs better than applying a fully-connected graph with geometry-human
+    connections." (Table 4, row 7)
+
+    Geometry→human conexiuni sunt EXCLUSE. Doar geometry→object si
+    human↔human/object sunt permise.
     """
 
     def __init__(self, visual_dim: int = 256, geo_dim: int = 128,
@@ -112,13 +118,49 @@ class FusionLevelGraph(nn.Module):
                 geo_out: Optional[torch.Tensor] = None,
                 entity_types: Optional[torch.Tensor] = None) -> torch.Tensor:
         v = self.visual_proj(visual)
-        if geo_out is not None:
+        if geo_out is not None and entity_types is not None:
+            # Paper: exclude geometry→human connections.
+            # entity_types: (B, M) — 0=human, 1=object
+            # Only object entities (type=1) attend to geometry nodes.
+            g = self.geo_proj(geo_out)
+
+            # Build attention keys: visual + geometry for object slots only
+            B, M, D = v.shape
+            num_obj = geo_out.shape[1]  # number of geometry nodes
+
+            # Object mask: (B, M, 1) — True where entity is an object
+            obj_mask = (entity_types == 1).unsqueeze(-1)  # (B, M, 1)
+            # Human mask: (B, M, 1) — True where entity is human
+            hum_mask = (entity_types == 0).unsqueeze(-1)  # (B, M, 1)
+
+            # Keys: visual nodes for all, geometry nodes for object entities only
+            # Humans attend only to visual nodes; objects attend to visual + geometry
+            all_keys = torch.cat([v, g], dim=1)  # (B, M + num_obj, D)
+
+            # Attention scores: (B, M, M + num_obj)
+            scores = torch.bmm(v, all_keys.transpose(1, 2)) / self.scale
+
+            # Mask: humans should NOT attend to geometry nodes
+            # Geometry nodes are at indices [M : M + num_obj]
+            # For human entities, zero out attention to geometry nodes
+            geo_mask = torch.ones(B, M, M + num_obj, device=v.device)
+            geo_mask[:, :, M:] = obj_mask  # (B, M, 1) broadcasts to (B, M, num_obj)
+            scores = scores.masked_fill(~geo_mask.bool(), float('-inf'))
+
+            weights = self.dropout(torch.softmax(scores, dim=-1))
+            out = torch.bmm(weights, all_keys)
+            return self.norm(out + v)
+        elif geo_out is not None:
+            # Fallback: no entity_types, use fully-connected (should not happen in practice)
             all_keys = torch.cat([v, self.geo_proj(geo_out)], dim=1)
+            scores = torch.bmm(v, all_keys.transpose(1, 2)) / self.scale
+            weights = self.dropout(torch.softmax(scores, dim=-1))
+            return self.norm(torch.bmm(weights, all_keys) + v)
         else:
-            all_keys = v
-        scores = torch.bmm(v, all_keys.transpose(1, 2)) / self.scale
-        weights = self.dropout(torch.softmax(scores, dim=-1))
-        return self.norm(torch.bmm(weights, all_keys) + v)
+            # No geometry at all — self-attention over visual nodes only
+            scores = torch.bmm(v, v.transpose(1, 2)) / self.scale
+            weights = self.dropout(torch.softmax(scores, dim=-1))
+            return self.norm(torch.bmm(weights, v) + v)
 
 
 # ---------------------------------------------------------------------------

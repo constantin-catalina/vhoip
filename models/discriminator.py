@@ -34,8 +34,9 @@ class Discriminator(nn.Module):
     """
     Discriminator binar din DGI adaptat pentru VHOIP (Eq. 1 din paper).
 
-    Arhitectura:
+    Arhitectura (conforma Eq. 1):
         Bratul global:  g_k  (clip_dim)
+                         -> σ₁ = Sigmoid (conform Eq. 1)
                          -> MLP: Linear(clip_dim -> feature_dim) -> ReLU
                                 Linear(feature_dim -> feature_dim)
                          -> L2 normalizare -> h_g  (feature_dim)
@@ -67,8 +68,10 @@ class Discriminator(nn.Module):
         if mlp_dim is None:
             mlp_dim = feature_dim
 
-        # Bratul global: MLP pe G (reprezentarile globale integrate)
+        # Bratul global: σ₁(g_k) -> MLP (conform Eq. 1 din paper)
+        # σ₁ = sigmoid, aplicat pe g_k inainte de MLP
         self.global_branch = nn.Sequential(
+            nn.Sigmoid(),
             nn.Linear(global_dim, mlp_dim),
             nn.ReLU(),
             nn.Linear(mlp_dim, mlp_dim),
@@ -112,7 +115,7 @@ class Discriminator(nn.Module):
         h_z = self.local_branch(z_norm)             # (B, N, mlp_dim)
         h_z = F.normalize(h_z, p=2, dim=-1)         # L2 normalizare dupa MLP
 
-        # Bratul global (Eq. 1: MLP(g_k) -> L2 normalizare)
+        # Bratul global (Eq. 1: σ₁(g_k) -> MLP -> L2 normalizare)
         h_g = self.global_branch(G)                 # (C, mlp_dim)
         h_g = F.normalize(h_g, p=2, dim=-1)         # L2 normalizare dupa MLP
 
