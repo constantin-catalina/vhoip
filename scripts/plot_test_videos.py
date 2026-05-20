@@ -31,18 +31,31 @@ def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
+    repo_root = str(Path(__file__).parent.parent.resolve())
+    def resolve_cfg(path):
+        if os.path.isabs(path):
+            return path
+        full = os.path.join(repo_root, path)
+        if os.path.exists(full):
+            return full
+        return path
+
     cfg = OmegaConf.merge(
-        OmegaConf.load("configs/base.yaml"),
-        OmegaConf.load("configs/mphoi72.yaml"),
+        OmegaConf.load(resolve_cfg("configs/base.yaml")),
+        OmegaConf.load(resolve_cfg("configs/mphoi72.yaml")),
     )
     label_names = MPHOI72Dataset.ACTIVITY_LABELS
     device = torch.device(args.device)
 
-    # Load model
+    # Load model (strict=False: checkpoint omits frozen CLIP weights)
     print(f"Loading checkpoint: {args.checkpoint}")
     model = VHOIP(cfg, label_names, device=str(device)).to(device)
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["model_state_dict"])
+    missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    if missing:
+        print(f"  [INFO] Missing keys (frozen params, initialized to defaults): {len(missing)}")
+    if unexpected:
+        print(f"  [INFO] Unexpected keys in checkpoint (ignored): {len(unexpected)}")
     model.set_inference_mode(True)
     print(f"  Loaded from epoch {ckpt['epoch']} | "
           f"FSUM={ckpt['metrics'].get('fsum', 0):.1f}")

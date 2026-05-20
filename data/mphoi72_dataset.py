@@ -811,11 +811,14 @@ class MPHOI72ZarrDataset(Dataset):
         # --- ROI features ---
         roi = np.load(os.path.join(feat_dir, f"{video_id}_roi.npy"))
 
-        # --- CLIP features (placeholder zeros sau reale dupa extract_clip_features) ---
+        # --- CLIP features (extrase offline cu CLIP ViT-B/16) ---
         clip_path = os.path.join(feat_dir, f"{video_id}_clip.npy")
-        clip = np.load(clip_path) if os.path.exists(clip_path) else np.zeros(
-            (roi.shape[0], roi.shape[1], self.clip_dim), dtype=np.float32
-        )
+        if not os.path.exists(clip_path):
+            raise RuntimeError(
+                f"CLIP features missing for {video_id}. "
+                f"Run extract_clip_features_from_videos() first."
+            )
+        clip = np.load(clip_path)
 
         # --- Geometric features ---
         geo_path = os.path.join(feat_dir, f"{video_id}_geo.npy")
