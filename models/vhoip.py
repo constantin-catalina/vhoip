@@ -257,10 +257,12 @@ class VHOIP(nn.Module):
 
         # -----------------------------------------------------------------------
         # Colecteaza Z' pentru EMA update la sfarsitul epoch-ului (Alg. 1)
-        # stop_gradient: .detach() este aplicat in FeaturesCollector.add()
+        # Filtram NaN/Inf inainte de a adauga in colector pentru a evita
+        # poluarea prototipurilor V cu features corupte de la gradient explosion.
         # -----------------------------------------------------------------------
         if labels is not None:
-            self.collector.add(z_prime, labels)
+            if not (torch.isnan(z_prime).any() or torch.isinf(z_prime).any()):
+                self.collector.add(z_prime, labels)
 
         return {
             "segment_logits":   segment_logits,    # (B, N, C) — pentru L_Label

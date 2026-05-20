@@ -13,6 +13,7 @@ def build_checkpoint_state(
     optimizer: torch.optim.Optimizer,
     epoch: int,
     metrics: dict,
+    criterion: torch.nn.Module = None,
     save_frozen: bool = False,
 ) -> dict:
     if save_frozen:
@@ -24,12 +25,24 @@ def build_checkpoint_state(
             k: v for k, v in model.state_dict().items()
             if k in trainable_names or not k.endswith(('.weight', '.bias'))
         }
-    return {
+
+    state = {
         "epoch": epoch,
         "model_state_dict": model_state,
         "optimizer_state_dict": optimizer.state_dict(),
         "metrics": metrics,
     }
+
+    # Save criterion state (e.g. learnable logit_scale for CosineSimilarityLoss)
+    if criterion is not None:
+        trainable_crit = {name for name, p in criterion.named_parameters() if p.requires_grad}
+        if trainable_crit:
+            state["criterion_state_dict"] = {
+                k: v for k, v in criterion.state_dict().items()
+                if k in trainable_crit
+            }
+
+    return state
 
 
 def save_checkpoint(
@@ -38,11 +51,12 @@ def save_checkpoint(
     epoch: int,
     metrics: dict,
     checkpoint_dir: str,
+    criterion: torch.nn.Module = None,
     is_best: bool = False,
     save_last: bool = False,
     save_local: bool = True,
 ) -> dict:
-    state = build_checkpoint_state(model, optimizer, epoch, metrics)
+    state = build_checkpoint_state(model, optimizer, epoch, metrics, criterion=criterion)
 
     if not save_local:
         return {"checkpoint": None, "best_checkpoint": None, "last_checkpoint": None, "state": state}
@@ -70,6 +84,7 @@ def load_checkpoint(
     model: torch.nn.Module,
     optimizer: Optional[torch.optim.Optimizer] = None,
     device: str = "cuda",
+    criterion: torch.nn.Module = None,
 ) -> dict:
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     # strict=False allows loading partial state dicts (e.g. without frozen CLIP weights)
@@ -81,6 +96,10 @@ def load_checkpoint(
 
     if optimizer and "optimizer_state_dict" in checkpoint:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+    # Restore criterion state (e.g. learnable logit_scale)
+    if criterion is not None and "criterion_state_dict" in checkpoint:
+        criterion.load_state_dict(checkpoint["criterion_state_dict"], strict=False)
 
     print(f"  --> Incarcat checkpoint din epoch {checkpoint['epoch']}")
     return checkpoint

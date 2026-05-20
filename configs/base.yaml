@@ -9,7 +9,7 @@ training:
   epochs: 50
   batch_size: 4
   learning_rate: 1.0e-3
-  warmup_epochs: 5               # epoci pentru warmup
+  warmup_epochs: 3               # epoci pentru warmup (aliniat cu stage1_epochs)
 
   # Coeficienti loss
   lambda1: 1.0                   # L_Seg
@@ -23,7 +23,7 @@ training:
   use_amp: false
 
   # Gradient clipping
-  grad_clip: 0.5
+  grad_clip: 5.0
 
 data:
   roi_dim: 2048                  # dimensiune ROI pooling Faster R-CNN

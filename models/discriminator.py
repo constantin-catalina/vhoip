@@ -3,18 +3,19 @@ discriminator.py
 Discriminatorul pentru Mutual Information loss (Eq. 1 din VHOIP paper).
 
 Formula din paper (Eq. 1):
-    y_hat_{i,k} = sigma1( MLP(sigma1(g_k))  *  MLP(sigma2(||z_i||_2)) )
+    y_hat_{i,k} = sigma( MLP(g_k) * MLP(z_i) )
 
 unde:
-    sigma1 = sigmoid
-    sigma2 = PReLU
-    ||z_i||_2 = z_i L2-normalizat   <-- IMPORTANT: normare explicita
     g_k   = componenta k din G (reprezentarea globala integrata, dim=clip_dim)
     z_i   = feature intermediar al entitatii i (din primul nivel BiRNN, dim=hidden_dim)
+    ||z_i||_2 = z_i L2-normalizat (conform Eq. 1)
+    sigma = sigmoid (aplicat implicit de BCEWithLogitsLoss)
 
-Discriminatorul primeste toate N*C perechi (z_i, g_k) si decide:
-    - pozitiv (1): z_i si g_k sunt din aceeasi clasa
-    - negativ (0): z_i si g_k sunt din clase diferite
+Arhitectura (conforma cu DGI/VHOIP):
+    Bratul global:  g_k -> MLP -> L2-normalizare -> h_g
+    Bratul local:   z_i -> L2-normalizare -> PReLU -> MLP -> L2-normalizare -> h_z
+    Output:         dot product h_g * h_z  ->  scor binar (raw logit)
+                    (sigmoid aplicat implicit de BCEWithLogitsLoss)
 
 NOTA despre implementare:
     Sigmoid-ul final din Eq. 1 NU este aplicat explicit in forward().
@@ -33,17 +34,18 @@ class Discriminator(nn.Module):
     """
     Discriminator binar din DGI adaptat pentru VHOIP (Eq. 1 din paper).
 
-    Arhitectura conforma cu Eq. 1:
+    Arhitectura:
         Bratul global:  g_k  (clip_dim)
-                         -> sigma1 = Sigmoid
-                         -> MLP: Linear(clip_dim -> feature_dim)
-                         -> vector h_g  (feature_dim)
+                         -> MLP: Linear(clip_dim -> feature_dim) -> ReLU
+                                Linear(feature_dim -> feature_dim)
+                         -> L2 normalizare -> h_g  (feature_dim)
 
         Bratul local:   z_i  (hidden_dim)
                          -> L2 normalizare: ||z_i||_2  (conform Eq. 1)
-                         -> sigma2 = PReLU
-                         -> MLP: Linear(hidden_dim -> feature_dim)
-                         -> vector h_z  (feature_dim)
+                         -> PReLU (sigma2 din Eq. 1)
+                         -> MLP: Linear(hidden_dim -> feature_dim) -> ReLU
+                                Linear(feature_dim -> feature_dim)
+                         -> L2 normalizare -> h_z  (feature_dim)
 
         Output:         dot product h_g * h_z  ->  scor binar (raw logit)
                         (sigmoid aplicat implicit de BCEWithLogitsLoss)
@@ -65,26 +67,20 @@ class Discriminator(nn.Module):
         if mlp_dim is None:
             mlp_dim = feature_dim
 
-        # -----------------------------------------------------------------------
-        # Bratul global: sigma1(g_k) -> MLP
-        # Ordinea din Eq. 1: INTAI sigmoid, APOI MLP (cu hidden layer)
-        # -----------------------------------------------------------------------
+        # Bratul global: MLP pe G (reprezentarile globale integrate)
         self.global_branch = nn.Sequential(
-            nn.Sigmoid(),                          # sigma1 din Eq. 1
-            nn.Linear(global_dim, mlp_dim),        # MLP hidden
+            nn.Linear(global_dim, mlp_dim),
             nn.ReLU(),
-            nn.Linear(mlp_dim, mlp_dim),           # MLP output
+            nn.Linear(mlp_dim, mlp_dim),
         )
 
-        # -----------------------------------------------------------------------
-        # Bratul local: ||z_i||_2 -> sigma2 -> MLP
+        # Bratul local: PReLU + MLP pe z (features intermediare)
         # L2-normalizarea este aplicata in forward() inainte de acest branch.
-        # -----------------------------------------------------------------------
         self.local_branch = nn.Sequential(
-            nn.PReLU(),                            # sigma2 din Eq. 1
-            nn.Linear(feature_dim, mlp_dim),       # MLP hidden
+            nn.PReLU(),
+            nn.Linear(feature_dim, mlp_dim),
             nn.ReLU(),
-            nn.Linear(mlp_dim, mlp_dim),           # MLP output
+            nn.Linear(mlp_dim, mlp_dim),
         )
 
     def forward(
@@ -107,38 +103,21 @@ class Discriminator(nn.Module):
         B, N, _ = z.shape
         C = G.shape[0]
 
-        # Sanitizeaza NaN-urile inainte de orice calcul.
-        # Daca gradientii au explodat upstream, z sau G pot contine NaN,
-        # ceea ce ar face ca toate scorurile si loss-ul MI sa devina NaN.
-        # nan_to_num(0.0) trateaza NaN ca vector zero — discriminatorul
-        # va produce scoruri neutrale (aproape de 0) pentru aceste intrari,
-        # ceea ce este mai bine decat propagarea NaN prin tot modelul.
+        # Sanitizeaza NaN-uri la intrare (de la gradient explosion upstream)
         z = torch.nan_to_num(z, nan=0.0)
         G = torch.nan_to_num(G, nan=0.0)
 
-        # -----------------------------------------------------------------------
-        # Bratul local (Eq. 1: sigma2(||z_i||_2) -> MLP)
-        # Pas 1: L2-normalizare explicita conform ||z_i||_2 din Eq. 1
-        # -----------------------------------------------------------------------
+        # Bratul local (Eq. 1: sigma2(||z_i||_2) -> MLP -> L2 normalizare)
         z_norm = F.normalize(z, p=2, dim=-1)       # (B, N, feature_dim)
-
-        # Pas 2+3: PReLU (sigma2) + MLP
         h_z = self.local_branch(z_norm)             # (B, N, mlp_dim)
+        h_z = F.normalize(h_z, p=2, dim=-1)         # L2 normalizare dupa MLP
 
-        # -----------------------------------------------------------------------
-        # Bratul global (Eq. 1: sigma1(g_k) -> MLP)
-        # G: (C, global_dim) — trebuie extins la (1, C, mlp_dim) pentru broadcasting
-        # -----------------------------------------------------------------------
-        # self.global_branch: Sigmoid -> Linear
-        # Input: (C, global_dim), Output: (C, mlp_dim)
+        # Bratul global (Eq. 1: MLP(g_k) -> L2 normalizare)
         h_g = self.global_branch(G)                 # (C, mlp_dim)
+        h_g = F.normalize(h_g, p=2, dim=-1)         # L2 normalizare dupa MLP
 
-        # -----------------------------------------------------------------------
         # Dot product (Eq. 1: h_g_k * h_z_i) pentru toate perechile (i, k)
         # h_z: (B, N, mlp_dim)
-        # h_g: (C, mlp_dim)
-        # scores[b, n, c] = h_z[b, n, :] . h_g[c, :]
-        # -----------------------------------------------------------------------
         # h_g: (C, mlp_dim) -> (1, mlp_dim, C) pentru einsum cu h_z
         h_g_T = h_g.t().unsqueeze(0)               # (1, mlp_dim, C)
         scores = torch.bmm(
