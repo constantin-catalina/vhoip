@@ -60,8 +60,14 @@ import zarr
 
 
 # ---------------------------------------------------------------------------
-# Constante geometrice
+# Constante dataset
 # ---------------------------------------------------------------------------
+
+MPHOI72_ACTIVITY_LABELS = [
+    "approaching", "lifting", "pouring", "placing", "drinking",
+    "cheering", "retreating", "working", "asking", "solving",
+    "sitting", "cutting", "drying",
+]
 
 # Numarul de joints per human din Azure Kinect Body Tracking SDK
 # (folosit de MPHOI-72 conform paperului)
@@ -250,9 +256,17 @@ def _extract_geo_features(
                                 if not k.lower().startswith("human")])
             for ok in obj_keys[:num_objects]:
                 arr = np.array(obox_data[ok], dtype=np.float32)
-                kp = _bbox_to_keypoints(arr, S)   # (S, 4, 2)
-                keypoint_sequences[num_humans + obj_idx] = kp
-                obj_idx += 1
+                # arr poate fi (S, 4) per obiect sau (S, O, 4) cu mai multe obiecte
+                if arr.ndim == 3 and arr.shape[2] == 4:
+                    # (S, O, 4) — mai multe obiecte intr-un singur array
+                    for o in range(min(arr.shape[1], num_objects - obj_idx)):
+                        kp = _bbox_to_keypoints(arr[:, o, :], S)
+                        keypoint_sequences[num_humans + obj_idx] = kp
+                        obj_idx += 1
+                else:
+                    kp = _bbox_to_keypoints(arr, S)   # (S, 4, 2)
+                    keypoint_sequences[num_humans + obj_idx] = kp
+                    obj_idx += 1
 
         elif hasattr(obox_data, "shape"):
             arr = np.array(obox_data, dtype=np.float32)
@@ -266,6 +280,9 @@ def _extract_geo_features(
     # -----------------------------------------------------------------------
     # Concateneaza toti keypoints: (S, J_total, 2)
     all_positions = np.concatenate(keypoint_sequences, axis=1)  # (S, J, 2)
+
+    # Inlocuieste NaN-uri (cadre unde Kinect nu a detectat skeleton-ul)
+    all_positions = np.nan_to_num(all_positions, nan=0.0)
 
     # Viteza = diferenta pozitie fata de frame-ul anterior
     velocities = np.zeros_like(all_positions)                    # (S, J, 2)
@@ -615,28 +632,59 @@ def _extract_labels(
     """
     Extrage etichetele segment si frame pentru un video.
 
+    Suporta doua formate:
+      1) {"entities": [{"labels": [...]}, ...]} — format cu cheia "entities"
+      2) {"Human1": [...], "Human2": [...]} — format MPHOI-72 nativ
+
+    Pentru obiecte (care nu au etichete proprii in GT), se folosesc
+    etichetele primului uman (actiunea e impartita de toate entitatile).
+
     Returns:
         seg_labels:   (N,) = (S*M,)  etichete per entitate per frame (flatten)
         frame_labels: (N,) = (S*M,)  identic cu seg_labels pentru compatibilitate
     """
+    labels_per_entity = []
+
+    # Format 1: cheia "entities"
     if isinstance(video_info, dict) and "entities" in video_info:
-        labels_per_entity = []
         for entity in video_info["entities"]:
             lbl = entity.get("labels", entity.get("actions", []))
             lbl_arr = np.array(lbl, dtype=np.int64)
-            # Ajusteaza la S frame-uri
             if len(lbl_arr) >= S:
                 lbl_arr = lbl_arr[:S]
             else:
-                lbl_arr = np.pad(lbl_arr, (0, S - len(lbl_arr)), constant_values=lbl_arr[-1] if len(lbl_arr) > 0 else 0)
+                lbl_arr = np.pad(lbl_arr, (0, S - len(lbl_arr)),
+                                 constant_values=lbl_arr[-1] if len(lbl_arr) > 0 else 0)
             labels_per_entity.append(lbl_arr)
 
-        if labels_per_entity:
-            # Construim (S, M) si aplatizam la (S*M,) in ordine frame-major (C-order):
-            # [s0m0, s0m1, ..., s0mM-1, s1m0, ...] — identic cu bms_to_bn din backbone.
-            label_matrix = np.stack(labels_per_entity, axis=1)  # (S, M)
-            flat_labels = label_matrix.flatten()                  # (S*M,)
-            return flat_labels, flat_labels.copy()
+    # Format 2: chei "Human1", "Human2", ... (MPHOI-72 nativ)
+    elif isinstance(video_info, dict):
+        human_keys = sorted([k for k in video_info if k.lower().startswith("human")])
+        for hk in human_keys[:M]:
+            lbl_arr = np.array(video_info[hk], dtype=np.int64)
+            if len(lbl_arr) >= S:
+                lbl_arr = lbl_arr[:S]
+            else:
+                lbl_arr = np.pad(lbl_arr, (0, S - len(lbl_arr)),
+                                 constant_values=lbl_arr[-1] if len(lbl_arr) > 0 else 0)
+            labels_per_entity.append(lbl_arr)
+
+        # Obiectele nu au etichete proprii in GT; folosim etichetele primului uman
+        num_humans = len(labels_per_entity)
+        num_objects = M - num_humans
+        if num_humans > 0 and num_objects > 0:
+            for _ in range(num_objects):
+                labels_per_entity.append(labels_per_entity[0].copy())
+
+    if labels_per_entity:
+        # Pad/truncate la exact M entitati
+        while len(labels_per_entity) < M:
+            labels_per_entity.append(labels_per_entity[0].copy())
+        labels_per_entity = labels_per_entity[:M]
+
+        label_matrix = np.stack(labels_per_entity, axis=1)  # (S, M)
+        flat_labels = label_matrix.flatten()                  # (S*M,)
+        return flat_labels, flat_labels.copy()
 
     # Fallback: zerouri
     N = S * M
@@ -720,11 +768,7 @@ class MPHOI72ZarrDataset(Dataset):
     """
 
     NUM_CLASSES = 13
-    ACTIVITY_LABELS = [
-        "approaching", "lifting", "pouring", "placing", "drinking",
-        "cheering", "retreating", "working", "asking", "solving",
-        "sitting", "cutting", "drying",
-    ]
+    ACTIVITY_LABELS = MPHOI72_ACTIVITY_LABELS
 
     def __init__(
         self,
