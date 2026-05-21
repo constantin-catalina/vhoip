@@ -1,31 +1,19 @@
 """
 inference.py
-Script pentru inferenta VHOIP pe imagini sau video.
+Script pentru inferenta VHOIP folosind features pre-extrase.
 
-Moduri de functionare:
+Ruleaza modelul pe features .npy (aceleasi folosite la training),
+eliminand mismatch-urile intre pipeline-ul de training si inferenta.
 
-1) --video-id (recomandat pentru dataset-ul MPHOI-72):
-   Incarca features pre-extrase din fisierele .npy (aceleasi folosite la training).
-   Elimina mismatch-urile intre pipeline-ul de training si cel de inferenta.
-
+Exemplu:
     python inference.py --config configs/mphoi72.yaml \
                         --video-id Subject12-task_1_cheering-take_0 \
                         --data-root data/mphoi72/ \
-                        --checkpoint_pattern "checkpoints/mphoi72_fold{fold}/w/o_L_Ant/best_model.pth" \
-                        --num_folds 28 --output results.json
+                        --checkpoint-pattern "checkpoints/mphoi72_fold{fold}/c6/best_model.pth" \
+                        --num-folds 28 --output results.json --visualize
 
-2) --input (inferenta pe video noi, cu extragere live):
-   Extrage automat ROI features (Faster R-CNN), keypoints (MediaPipe)
-   si entity types din detectii. ATENTIE: rezultatele pot diferi fata de
-   training din cauza mismatch-urilor de distributie a features.
-
-    python inference.py --config configs/mphoi72.yaml \
-                        --checkpoint checkpoints/best_model.pth \
-                        --input path/to/video.mp4 \
-                        --output results.json --visualize
-
-Dependinte suplimentare (doar pentru modul --input):
-    pip install mediapipe
+Pentru vizualizare, specifica --input <path_video> sau lasa scriptul
+sa caute automat fisierul video in --data-root.
 """
 
 import os
@@ -35,20 +23,16 @@ sys.path.insert(0, str(Path(__file__).parent.parent.resolve()))
 
 import json
 import argparse
-from typing import List, Tuple, Optional, Dict
+from typing import List, Dict
 from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 import cv2
-import torchvision.transforms as T
-from torchvision.models.detection import fasterrcnn_resnet50_fpn
-from torchvision.ops import roi_pool
 from omegaconf import OmegaConf
 
 # Proiect
-from data.preprocess import VideoReader, IMAGENET_MEAN, IMAGENET_STD
+from data.preprocess import VideoReader
 from models.vhoip import VHOIP
 from utils.checkpoint import load_checkpoint
 from utils.video_annotation import (
@@ -57,340 +41,6 @@ from utils.video_annotation import (
 )
 
 # Vizualizare: vezi utils/viz_opencv.py
-
-
-# ---------------------------------------------------------------------------
-# MediaPipe Pose Extractor
-# ---------------------------------------------------------------------------
-
-class MediaPipeExtractor:
-    """
-    Extrage keypoints umane (33 landmarks) cu MediaPipe PoseLandmarker per entitate.
-    Se ruleaza pe crop-urile individuale detectate de Faster R-CNN.
-    Foloseste API-ul MediaPipe Tasks (nou, inlocuieste mp.solutions).
-    """
-
-    NUM_LANDMARKS = 33
-
-    def __init__(self, static_image_mode: bool = False):
-        try:
-            from mediapipe.tasks.python.vision import PoseLandmarker, PoseLandmarkerOptions
-            from mediapipe.tasks.python.core.base_options import BaseOptions
-            from mediapipe.tasks.python.vision import RunningMode
-        except ImportError:
-            raise ImportError(
-                "MediaPipe nu este instalat sau versiunea nu suporta Tasks API. Ruleaza:\n"
-                "  pip install mediapipe>=0.10.0"
-            )
-
-        model_url = (
-            "https://storage.googleapis.com/mediapipe-models/"
-            "pose_landmarker/pose_landmarker_heavy/float16/latest/"
-            "pose_landmarker_heavy.task"
-        )
-        model_path = os.path.join(
-            os.path.dirname(__file__), "..", "pose_landmarker_heavy.task"
-        )
-        model_path = os.path.abspath(model_path)
-
-        if not os.path.exists(model_path):
-            print(f"Descarc model MediaPipe Pose: {model_path} ...")
-            import urllib.request
-            os.makedirs(os.path.dirname(model_path), exist_ok=True)
-            urllib.request.urlretrieve(model_url, model_path)
-            print("Model descarcata.")
-
-        base_options = BaseOptions(model_asset_path=model_path)
-        options = PoseLandmarkerOptions(
-            base_options=base_options,
-            running_mode=RunningMode.IMAGE,
-            num_poses=1,
-            min_pose_detection_confidence=0.5,
-            min_pose_presence_confidence=0.5,
-        )
-        self.landmarker = PoseLandmarker.create_from_options(options)
-
-    def extract(self, frame_bgr: np.ndarray, box: np.ndarray) -> Optional[np.ndarray]:
-        """
-        Args:
-            frame_bgr: (H, W, 3) imagine BGR completa
-            box: (4,) bounding box [x1, y1, x2, y2] in pixeli
-
-        Returns:
-            landmarks: (33, 2) array [x, y] in coordonatele frame-ului original,
-                       sau None daca MediaPipe nu gaseste pose.
-        """
-        H, W = frame_bgr.shape[:2]
-        x1, y1, x2, y2 = map(int, box)
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(W, x2), min(H, y2)
-
-        if x2 - x1 < 5 or y2 - y1 < 5:
-            return None
-
-        crop = frame_bgr[y1:y2, x1:x2]
-        if crop.size == 0:
-            return None
-
-        from mediapipe import Image, ImageFormat
-        rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-        mp_image = Image(image_format=ImageFormat.SRGB, data=rgb)
-
-        result = self.landmarker.detect(mp_image)
-
-        if not result.pose_landmarks:
-            return None
-
-        landmarks = []
-        for lm in result.pose_landmarks[0]:
-            px = lm.x * (x2 - x1) + x1
-            py = lm.y * (y2 - y1) + y1
-            landmarks.append([px, py])
-
-        return np.array(landmarks, dtype=np.float32)  # (33, 2)
-
-    def close(self):
-        self.landmarker.close()
-
-
-# ---------------------------------------------------------------------------
-# Faster R-CNN cu ROI + labels
-# ---------------------------------------------------------------------------
-
-class InferenceRCNN(torch.nn.Module):
-    """
-    Wrapper peste Faster R-CNN care returneaza ROI features, boxes si labels.
-    """
-
-    def __init__(self, device: str = "cuda", score_threshold: float = 0.3):
-        super().__init__()
-        self.device = device
-        self.score_threshold = score_threshold
-
-        self.model = fasterrcnn_resnet50_fpn(pretrained=True)
-        self.model.eval().to(device)
-        self.backbone = self.model.backbone
-
-        self.fc_layers = torch.nn.Sequential(
-            torch.nn.Linear(256 * 7 * 7, 2048),
-            torch.nn.ReLU(),
-            torch.nn.Linear(2048, 2048),
-        ).to(device)
-
-        for p in self.parameters():
-            p.requires_grad = False
-
-        # COCO class 1 = person
-        self.PERSON_LABEL = 1
-
-    @torch.no_grad()
-    def forward(self, frame_tensor: torch.Tensor, max_entities: int = 5):
-        """
-        Args:
-            frame_tensor: (3, H, W) normalizat ImageNet
-        Returns:
-            roi_feats:  (max_entities, 2048)
-            boxes:      (max_entities, 4)
-            labels:     (max_entities,) int, 1=person(human), restul=object
-            scores:     (max_entities,)
-        """
-        batch = frame_tensor.unsqueeze(0).to(self.device)
-        detections = self.model(batch)[0]
-
-        keep = detections["scores"] >= self.score_threshold
-        boxes_all = detections["boxes"][keep]
-        labels_all = detections["labels"][keep]
-        scores_all = detections["scores"][keep]
-
-        if len(boxes_all) > max_entities:
-            topk = scores_all.argsort(descending=True)[:max_entities]
-            boxes_all = boxes_all[topk]
-            labels_all = labels_all[topk]
-            scores_all = scores_all[topk]
-
-        num_detected = len(boxes_all)
-        H_img, W_img = frame_tensor.shape[1], frame_tensor.shape[2]
-
-        if num_detected == 0:
-            boxes_all = torch.tensor([[0., 0., W_img, H_img]], device=self.device)
-            labels_all = torch.tensor([1], device=self.device, dtype=torch.int64)
-            scores_all = torch.tensor([1.0], device=self.device)
-            num_detected = 1
-
-        # ROI Pooling
-        feat_dict = self.backbone(batch)
-        feature_map = feat_dict["0"]
-        spatial_scale = feature_map.shape[2] / H_img
-
-        batch_boxes = torch.cat([
-            torch.zeros(len(boxes_all), 1, device=self.device),
-            boxes_all
-        ], dim=1)
-
-        roi_feats = roi_pool(
-            feature_map,
-            batch_boxes,
-            output_size=(7, 7),
-            spatial_scale=spatial_scale,
-        )
-        roi_feats = roi_feats.flatten(1)
-        roi_feats = self.fc_layers(roi_feats)
-
-        # Padding la max_entities
-        M = max_entities
-        padded_feats = torch.zeros(M, 2048, device=self.device)
-        padded_boxes = torch.zeros(M, 4, device=self.device)
-        padded_labels = torch.ones(M, device=self.device, dtype=torch.int64)
-        padded_scores = torch.zeros(M, device=self.device)
-
-        n = min(num_detected, M)
-        padded_feats[:n] = roi_feats[:n]
-        padded_boxes[:n] = boxes_all[:n]
-        padded_labels[:n] = labels_all[:n]
-        padded_scores[:n] = scores_all[:n]
-
-        # Mapare: person (1) -> 0 (human), restul -> 1 (object)
-        entity_types = torch.where(padded_labels == self.PERSON_LABEL, 0, 1)
-
-        return padded_feats.cpu(), padded_boxes.cpu(), entity_types.cpu(), padded_scores.cpu()
-
-
-# ---------------------------------------------------------------------------
-# Utilitare geometry
-# ---------------------------------------------------------------------------
-
-def bbox_to_keypoints(box: np.ndarray) -> np.ndarray:
-    """
-    Converteste bbox [x1, y1, x2, y2] in 4 colturi -> (4, 2).
-    """
-    x1, y1, x2, y2 = box
-    return np.array([
-        [x1, y1],
-        [x2, y1],
-        [x2, y2],
-        [x1, y2],
-    ], dtype=np.float32)
-
-
-def build_geometry_sequence(
-    frames: List[np.ndarray],
-    boxes: np.ndarray,           # (S, M, 4)
-    entity_types: np.ndarray,    # (S, M)
-    mp_extractor: MediaPipeExtractor,
-) -> np.ndarray:
-    """
-    Construieste geo_features (S, J, 4) pentru toate frame-urile.
-    """
-    S, M = boxes.shape[:2]
-
-    keypoints_list: List[List[Optional[np.ndarray]]] = []
-
-    for s in range(S):
-        frame_kp = []
-        for m in range(M):
-            et = entity_types[s, m]
-            box = boxes[s, m]
-
-            if box[2] - box[0] < 1 or box[3] - box[1] < 1:
-                frame_kp.append(None)
-                continue
-
-            if et == 0:  # human
-                kp = mp_extractor.extract(frames[s], box)
-                if kp is None:
-                    kp = bbox_to_keypoints(box)
-                frame_kp.append(kp)
-            else:  # object
-                kp = bbox_to_keypoints(box)
-                frame_kp.append(kp)
-        keypoints_list.append(frame_kp)
-
-    K_per_entity = []
-    for m in range(M):
-        km = 4
-        for s in range(S):
-            if keypoints_list[s][m] is not None:
-                km = keypoints_list[s][m].shape[0]
-                break
-        K_per_entity.append(km)
-
-    J = sum(K_per_entity)
-    all_positions = np.zeros((S, J, 2), dtype=np.float32)
-
-    for s in range(S):
-        idx = 0
-        for m in range(M):
-            km = K_per_entity[m]
-            kp = keypoints_list[s][m]
-            if kp is not None and kp.shape[0] == km:
-                all_positions[s, idx:idx+km] = kp
-            idx += km
-
-    velocities = np.zeros_like(all_positions)
-    velocities[1:] = all_positions[1:] - all_positions[:-1]
-
-    geo = np.concatenate([all_positions, velocities], axis=-1).astype(np.float32)
-    return geo
-
-
-# ---------------------------------------------------------------------------
-# Pipeline principal
-# ---------------------------------------------------------------------------
-
-def extract_features(
-    input_path: str,
-    device: str,
-    max_entities: int = 5,
-    max_frames: Optional[int] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, np.ndarray, List[np.ndarray]]:
-    """
-    Proceseaza un video sau director de imagini si returneaza tensori gata pentru model.
-
-    Returns:
-        roi_features:  (1, S, M, 2048)
-        geo_features:  (1, S, J, 4)
-        entity_types:  (1, M)
-        boxes:         (S, M, 4) — pentru vizualizare
-        frames:        lista frame-uri BGR
-    """
-    reader = VideoReader(input_path, max_frames=max_frames)
-    frames = reader.read_frames()
-    if not frames:
-        raise ValueError(f"Nu am gasit frame-uri in: {input_path}")
-
-    S = len(frames)
-    print(f"Procesez {S} frame-uri...")
-
-    imagenet_transform = T.Compose([
-        T.ToTensor(),
-        T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-    ])
-
-    rcnn = InferenceRCNN(device=device).to(device)
-    mp_extractor = MediaPipeExtractor(static_image_mode=(S == 1))
-
-    roi_all = np.zeros((S, max_entities, 2048), dtype=np.float32)
-    boxes_all = np.zeros((S, max_entities, 4), dtype=np.float32)
-    etypes_all = np.ones((S, max_entities), dtype=np.int64)
-
-    for s, frame_bgr in enumerate(frames):
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        frame_tensor = imagenet_transform(frame_rgb)
-
-        roi_feats, boxes, etypes, _ = rcnn(frame_tensor, max_entities=max_entities)
-
-        roi_all[s] = roi_feats.numpy()
-        boxes_all[s] = boxes.numpy()
-        etypes_all[s] = etypes.numpy()
-
-    geo_all = build_geometry_sequence(frames, boxes_all, etypes_all, mp_extractor)
-    mp_extractor.close()
-
-    roi_t = torch.FloatTensor(roi_all).unsqueeze(0)
-    geo_t = torch.FloatTensor(geo_all).unsqueeze(0)
-    etypes_t = torch.LongTensor(etypes_all[0]).unsqueeze(0)
-
-    return roi_t, geo_t, etypes_t, boxes_all, frames
 
 
 # ---------------------------------------------------------------------------
@@ -582,19 +232,18 @@ def parse_args():
                         help="Pattern cu {fold} pentru ensemble, ex: checkpoints/fold{fold}/best.pth")
     parser.add_argument("--num-folds", type=int, default=28,
                         help="Numar fold-uri pentru ensemble (default 28 pentru MPHOI-72)")
-    # Input: unul din --video-id sau --input este obligatoriu
-    parser.add_argument("--video-id", type=str, default=None,
+    parser.add_argument("--video-id", type=str, default=None, required=True,
                         help="Video ID din dataset (ex: Subject12-task_1_cheering-take_0). "
                              "Incarca features pre-extrase din data-root, identic cu training.")
     parser.add_argument("--data-root", type=str, default="data/mphoi72/",
                         help="Directorul radacina al dataset-ului (folosit cu --video-id)")
     parser.add_argument("--input", type=str, default=None,
-                        help="Path video sau director imagini (extragere live, nu recomandat)")
+                        help="Path video sau director imagini pentru vizualizare (optional). "
+                             "Daca lipseste, scriptul cauta automat video in --data-root.")
     parser.add_argument("--output", type=str, default="inference_results.json", help="Fisier output JSON")
     parser.add_argument("--visualize", action="store_true", help="Genereaza video annotat + timeline PNG")
     parser.add_argument("--video-out", type=str, default=None,
                         help="Path video output (default: <output>.mp4)")
-    parser.add_argument("--max-entities", type=int, default=5)
     parser.add_argument("--max-frames", type=int, default=None)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dataset-name", type=str, default=None)
@@ -610,14 +259,20 @@ def main():
     device = torch.device(args.device)
 
     # Validare args
-    if args.video_id is None and args.input is None:
-        raise ValueError("Specifica --video-id (recomandat) sau --input.")
-    if args.video_id and args.input:
-        raise ValueError("Specifica doar unul din --video-id sau --input, nu ambele.")
     if args.checkpoint is None and args.checkpoint_pattern is None:
         raise ValueError("Specifica --checkpoint sau --checkpoint-pattern.")
     if args.checkpoint is not None and args.checkpoint_pattern is not None:
         print("[WARN] Ambele --checkpoint si --checkpoint-pattern specificate. Folosesc --checkpoint-pattern.")
+
+    # Director output: outputs/<nume_folder_data_root>/<video_id>.ext
+    subfolder = os.path.basename(os.path.normpath(args.data_root))
+    out_dir = os.path.join("outputs", subfolder)
+    os.makedirs(out_dir, exist_ok=True)
+
+    if not os.path.dirname(args.output):
+        args.output = os.path.join(out_dir, f"{args.video_id}.json")
+    if args.video_out and not os.path.dirname(args.video_out):
+        args.video_out = os.path.join(out_dir, os.path.basename(args.video_out))
 
     cfg = OmegaConf.merge(
         OmegaConf.load("configs/base.yaml"),
@@ -629,41 +284,49 @@ def main():
 
     print(f"Dataset: {dataset_name} | Clase: {label_names}")
     print(f"Device: {device}")
+    print(f"Output dir: {out_dir}")
 
     # -----------------------------------------------------------------------
-    # Incarcare features
+    # Incarcare features pre-extrase
     # -----------------------------------------------------------------------
-    boxes_all = None  # pentru vizualizare (doar modul --input)
-    frames = None     # pentru vizualizare (doar modul --input)
+    boxes_all = None  # pentru vizualizare
+    frames = None     # pentru vizualizare
 
-    if args.video_id:
-        # Mod RECOMANDAT: features pre-extrase din dataset (identic cu training)
-        print(f"\n[1/3] Incarcare features pre-extrase pentru: {args.video_id}")
-        data = load_preextracted_features(
-            args.video_id, args.data_root, clip_dim=cfg.model.clip_dim,
-        )
-        roi_features  = data["roi_features"].to(device)
-        geo_features  = data["geo_features"].to(device)
-        entity_types   = data["entity_types"].to(device)
-        clip_features  = data["clip_features"].to(device)
-        gt_labels      = data["gt_labels"]
-        input_label    = args.video_id
-    else:
-        # Mod live: extragere cu Faster R-CNN + MediaPipe (poate avea mismatch-uri)
-        print(f"\n[1/3] Extragere features ROI + geometrie (live)...")
-        print("[WARN] Modul live poate produce rezultate diferite fata de training din cauza mismatch-urilor.")
-        roi, geo, etypes, boxes_all, frames = extract_features(
-            args.input,
-            device=str(device),
-            max_entities=args.max_entities,
-            max_frames=args.max_frames,
-        )
-        roi_features = roi.to(device)
-        geo_features = geo.to(device)
-        entity_types  = etypes.to(device)
-        clip_features = None
-        gt_labels      = None
-        input_label    = args.input
+    print(f"\n[1/3] Incarcare features pre-extrase pentru: {args.video_id}")
+    data = load_preextracted_features(
+        args.video_id, args.data_root, clip_dim=cfg.model.clip_dim,
+    )
+    roi_features = data["roi_features"].to(device)
+    geo_features = data["geo_features"].to(device)
+    entity_types = data["entity_types"].to(device)
+    clip_features = data["clip_features"].to(device)
+    gt_labels = data["gt_labels"]
+    boxes_all = data.get("bboxes")
+    input_label = args.video_id
+
+    if args.visualize:
+        video_path = args.input
+        if not video_path:
+            candidates = [
+                os.path.join(args.data_root, f"{args.video_id}.mp4"),
+                os.path.join(args.data_root, f"{args.video_id}.avi"),
+                os.path.join(args.data_root, args.video_id, f"{args.video_id}.mp4"),
+                os.path.join(args.data_root, "..", f"{args.video_id}.mp4"),
+            ]
+            for cand in candidates:
+                if os.path.exists(cand):
+                    video_path = cand
+                    break
+        if video_path and os.path.exists(video_path):
+            print(f"  Incarca frame-uri pentru vizualizare din: {video_path}")
+            reader = VideoReader(video_path, max_frames=args.max_frames)
+            frames = reader.read_frames()
+            if frames:
+                print(f"  {len(frames)} frame-uri incarcate.")
+            else:
+                print(f"  [WARN] Nu am gasit frame-uri in: {video_path}")
+        else:
+            print(f"  [WARN] Nu am gasit video pentru vizualizare. Specifica --input <path>.")
 
     print(f"  ROI: {roi_features.shape}")
     print(f"  Geo: {geo_features.shape}")
@@ -753,16 +416,17 @@ def main():
             pct = count / pred_classes.size * 100
             print(f"  {cls_name:<20} {'#' * int(pct/2):<25} {pct:.1f}%")
 
-    # Vizualizare (doar modul --input)
+    # Vizualizare
     if args.visualize and frames is not None and boxes_all is not None:
         print("\n[4/4] Generare vizualizare...")
-        video_out = args.video_out or args.output.replace(".json", ".mp4")
-        if video_out == args.output:
-            video_out = "inference_visualization.mp4"
+        if args.video_out:
+            video_out = args.video_out
+        else:
+            out_dir = os.path.dirname(args.output) or "."
+            video_out = os.path.join(out_dir, f"{args.video_id}.mp4")
+        raw_path = video_out.replace(".mp4", "_raw.npz")
 
         save_visualization_video(frames, boxes_all, pred_classes, label_names, video_out, fps=args.fps)
-
-        raw_path = args.output.replace(".json", "_raw.npz")
         save_raw_data_npz(raw_path, frames, boxes_all, pred_classes, entity_types.cpu().numpy())
 
 
