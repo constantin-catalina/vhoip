@@ -21,6 +21,7 @@ from pathlib import Path
 
 
 ABLATIONS = [
+    # --- C6 ablations (loss components / features) ---
     {
         "name": "w/o_L_Ant",
         "overrides": ["training.lambda_ant=0"],
@@ -44,6 +45,22 @@ ABLATIONS = [
     {
         "name": "w/o_L_Cos",
         "overrides": ["training.lambda3=0"],
+    },
+    # --- C1 ablations (boundary detector kernel size) ---
+    {
+        "name": "k3",
+        "prefix": "c1_",
+        "overrides": ["model.boundary_kernel_size=3"],
+    },
+    {
+        "name": "k5",
+        "prefix": "c1_",
+        "overrides": ["model.boundary_kernel_size=5"],
+    },
+    {
+        "name": "k7",
+        "prefix": "c1_",
+        "overrides": ["model.boundary_kernel_size=7"],
     },
 ]
 
@@ -153,7 +170,7 @@ def main():
     run_idx = 0
 
     for ablation in ABLATIONS:
-        exp_name = f"c6_{ablation['name']}"
+        exp_name = f"{ablation.get('prefix', 'c6_')}{ablation['name']}"
         print(f"\n>>> Ablation: {exp_name}")
 
         for fold in range(args.folds):

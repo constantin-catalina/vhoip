@@ -12,7 +12,7 @@ Arhitectura (Fig. 2 ASSIGN + Fig. 3 2G-GCN):
     2. FusionLevelGraph       — fuziune raw ROI + geometric -> D  (2G-GCN Eq. 4)
     3. FrameLevelBiRNN        — BiRNN pe features imbogatite, h^e_{t,f}  (ASSIGN Eq. 1)
     4. SpatialMessagePassing  — mesaje intra/inter-class  (ASSIGN Eq. 2–4)
-    5. SegmentBoundaryDetector — MLP + Gumbel-Softmax, u^e_t  (ASSIGN Eq. 5)
+    5. TemporalContextBoundaryDetector — 1D separable conv + Gumbel-Softmax, u^e_t  (ASSIGN Eq. 5, C1)
 
 Training in doua stagii (ASSIGN §3.5):
   Stage 1: u^e_t := 1 everywhere (dense), L_Seg oprit
