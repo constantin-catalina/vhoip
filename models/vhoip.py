@@ -84,6 +84,7 @@ class VHOIP(nn.Module):
             geo_input_dim=getattr(cfg.data, "geo_input_dim", 4),
             C1=getattr(cfg.model, "geo_C1", 64),
             C2=getattr(cfg.model, "geo_C2", 128),
+            boundary_kernel_size=getattr(cfg.model, "boundary_kernel_size", 5),
         )
 
         # -----------------------------------------------------------------------

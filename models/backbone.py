@@ -208,45 +208,83 @@ class SpatialMessagePassing(nn.Module):
 # Segment Boundary Detector  (ASSIGN §3.3, Eq. 5)
 # ---------------------------------------------------------------------------
 
-class SegmentBoundaryDetector(nn.Module):
+class TemporalContextBoundaryDetector(nn.Module):
     """
-    u^e_t = GSM( gamma([x^e_t; h^e_{t,f}; m^{intra}; m^{inter}]) )
+    Detector de granite cu context temporal local (Contribution 1).
 
-    - Training Stage 2: Gumbel-Softmax (differentiable), Straight-Through dla backward
-    - Training Stage 1: u := 1 everywhere (handled in Backbone2GGCN.forward)
-    - Inference: argmax
+    Inlocuieste MLP-ul punctual cu un bloc convolutiv 1D separabil
+    pe o fereastra de ±(kernel_size//2) frame-uri, pastrand
+    semnatura de iesire identica (u_soft, u_hard).
 
     Input dim = 6*D: [x(D); h_f(D); m_intra(2D); m_inter(2D)]
     """
 
-    def __init__(self, input_dim: int, temperature: float = 1.0,
-                 threshold: float = 0.5):
+    def __init__(
+        self,
+        input_dim: int,
+        temperature: float = 1.0,
+        threshold: float = 0.5,
+        kernel_size: int = 5,
+    ):
         super().__init__()
-        mid = input_dim // 2
-        self.gamma = nn.Sequential(
-            nn.Linear(input_dim, mid), nn.ReLU(),
-            nn.Linear(mid, 2),
+        mid = input_dim // 2  # 3*D when input_dim = 6*D
+
+        self.input_proj = nn.Linear(input_dim, mid)
+
+        padding = kernel_size // 2
+        self.depthwise = nn.Conv1d(
+            mid, mid, kernel_size=kernel_size, padding=padding, groups=mid
         )
+        self.norm = nn.LayerNorm(mid)
+        self.pointwise = nn.Conv1d(mid, mid, kernel_size=1)
+
+        self.output_proj = nn.Linear(mid, 2)
+
         self.temperature = temperature
-        self.threshold   = threshold
+        self.threshold = threshold
+        self.kernel_size = kernel_size
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Args:  x: (B_flat, input_dim)
+        Args:  x: (B, M, S, input_dim)
         Returns:
-            u_soft: (B_flat,)  — real-valued (for L_Seg loss)
-            u_hard: (B_flat,)  — binary float, ST gradient at training
+            u_soft: (B, M, S)
+            u_hard: (B, M, S)
         """
-        logits = self.gamma(x)   # (B_flat, 2)
+        B, M, S, _ = x.shape
 
+        # Step 1 — Input projection
+        h = self.input_proj(x)  # (B, M, S, mid)
+
+        # Step 2 — Temporal 1D separable conv
+        h = h.reshape(B * M, S, -1)   # (B*M, S, mid)
+        h = h.permute(0, 2, 1)        # (B*M, mid, S)
+
+        residual = h
+        h = self.depthwise(h)         # (B*M, mid, S)
+        h = h.permute(0, 2, 1)        # (B*M, S, mid)
+        h = self.norm(h)
+        h = F.gelu(h)
+        h = h.permute(0, 2, 1)        # (B*M, mid, S)
+        h = self.pointwise(h)         # (B*M, mid, S)
+        h = h + residual              # residual connection
+
+        h = h.permute(0, 2, 1)        # (B*M, S, mid)
+        h = h.reshape(B, M, S, -1)    # (B, M, S, mid)
+
+        # Step 3 — Output projection
+        logits = self.output_proj(h)  # (B, M, S, 2)
+
+        # Step 4 — Identical Gumbel-Softmax / argmax logic
         if self.training:
-            gsm    = F.gumbel_softmax(logits, tau=self.temperature, hard=False)
-            u_soft = gsm[:, 1]                                  # prob "change"
-            u_hard = (u_soft > self.threshold).float()
-            u_hard = u_hard - u_soft.detach() + u_soft          # Straight-Through
+            gsm = F.gumbel_softmax(logits, tau=self.temperature, hard=False)
+            u_soft = gsm[..., 1]
+            # Correct STE: forward = hard decision, backward = soft gradient
+            u_hard_detached = (u_soft > self.threshold).float().detach()
+            u_hard = u_hard_detached + u_soft - u_soft.detach()
         else:
-            probs  = torch.softmax(logits / self.temperature, dim=-1)
-            u_soft = probs[:, 1]
+            probs = torch.softmax(logits / self.temperature, dim=-1)
+            u_soft = probs[..., 1]
             u_hard = (u_soft > self.threshold).float()
 
         return u_soft, u_hard
@@ -446,6 +484,7 @@ class Backbone2GGCN(nn.Module):
         C2: int = 128,
         gsm_temp: float = 1.0,
         boundary_threshold: float = 0.5,
+        boundary_kernel_size: int = 5,
     ):
         super().__init__()
         self.hidden_dim  = hidden_dim
@@ -460,10 +499,11 @@ class Backbone2GGCN(nn.Module):
         self.msg_passing  = SpatialMessagePassing()
 
         # Detector: input = [x_fused(D); h_f(D); m_intra(2D); m_inter(2D)] = 6D
-        self.boundary_detector = SegmentBoundaryDetector(
+        self.boundary_detector = TemporalContextBoundaryDetector(
             input_dim=6 * hidden_dim,
             temperature=gsm_temp,
             threshold=boundary_threshold,
+            kernel_size=boundary_kernel_size,
         )
 
         self.segment_layer = SegmentLevelLayer(hidden_dim, num_classes, num_layers, dropout)
@@ -543,6 +583,12 @@ class Backbone2GGCN(nn.Module):
         # ---- 5. Segment Boundary Detector  (Eq. 5) ----
         if training_stage == 1:
             # Stage 1: toate frame-urile sunt granite (dense)
+            # Detectorul nu e folosit, dar il rulam pentru warm-start
+            # (parametrii primesc gradiente doar in Stage 2 prin L_Seg)
+            det_in = torch.cat([
+                x_proj_bms, h_f_fused, m_intra_f, m_inter_f,
+            ], dim=-1)
+            _ = self.boundary_detector(det_in)   # warm-start: statistici LayerNorm
             u_soft_bms = torch.ones(B, M, S, device=device)
             u_hard_bms = torch.ones(B, M, S, device=device)
         else:
@@ -555,10 +601,7 @@ class Backbone2GGCN(nn.Module):
                 m_inter_f,    # (B, M, S, 2D)
             ], dim=-1)        # (B, M, S, 6D)
 
-            det_flat = det_in.reshape(B * M * S, -1)   # (B*M*S, 6D)
-            u_soft_flat, u_hard_flat = self.boundary_detector(det_flat)
-            u_soft_bms = u_soft_flat.reshape(B, M, S)
-            u_hard_bms = u_hard_flat.reshape(B, M, S)
+            u_soft_bms, u_hard_bms = self.boundary_detector(det_in)
 
         # ---- 6. Segment-level Layer  (Eq. 6–10) ----
         _, seg_logits_4d = self.segment_layer(

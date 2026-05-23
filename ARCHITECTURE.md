@@ -108,16 +108,22 @@ The backbone integrates a **2-Graph GCN** (geometric + fusion graph) for spatial
 
 **Output**: `m_inter` `(B, M, 512)`, `m_intra` `(B, M, 512)`
 
-### 1.5 SegmentBoundaryDetector
+### 1.5 TemporalContextBoundaryDetector
 
-**Input**: `concat[x_fused(D); h_f(D); m_intra(2D); m_inter(2D)]` = `(B*M*S, 6*D)`
+**Input**: `concat[x_fused(D); h_f(D); m_intra(2D); m_inter(2D)]` = `(B, M, S, 6*D)`
 
 **Architecture**:
-- MLP: `6D -> 3D -> 2` (ReLU hidden)
+- Input projection: `Linear(6*D -> 3*D)`
+- Temporal 1D depthwise-separable convolution block (kernel size = `boundary_kernel_size`):
+  - `Conv1d(3*D, 3*D, kernel_size=K, padding=K//2, groups=3*D)` — depthwise temporal filter
+  - `LayerNorm + GELU`
+  - `Conv1d(3*D, 3*D, kernel_size=1)` — pointwise mix
+  - Residual connection
+- Output projection: `Linear(3*D -> 2)`
 - **Training Stage 2**: Gumbel-Softmax with straight-through estimator
   - `u_soft` = probability of boundary change
   - `u_hard` = binary mask (1 = new segment, 0 = continue)
-- **Training Stage 1**: `u := 1` everywhere (dense boundaries)
+- **Training Stage 1**: `u := 1` everywhere (dense boundaries); conv block runs but output is discarded
 - **Inference**: argmax over softmax
 
 **Output**:
@@ -368,6 +374,7 @@ At inference time, the model switches to evaluation mode:
 | `model.dropout` | `0.3` | Dropout rate |
 | `model.use_learnable_prompts` | `true` | Enable C6b learnable prompts |
 | `model.prompt_n_ctx` | `16` | Number of learnable context tokens |
+| `model.boundary_kernel_size` | `5` | Temporal conv kernel for boundary detector (C1) |
 | `training.epochs` | `50` | Training epochs |
 | `training.batch_size` | `4` | Batch size |
 | `training.learning_rate` | `1e-3` | Learning rate |
@@ -399,7 +406,7 @@ Stage 1: Backbone (2G-GCN + ASSIGN)
   ├─ FusionLevelGraph   ->  x_fused  (B, M, S, 256)
   ├─ FrameLevelBiRNN    ->  z  (B, N, 256), frame_logits  (B, N, C)
   ├─ SpatialMessagePassing  ->  m_inter, m_intra  (B, M, S, 512)
-  ├─ SegmentBoundaryDetector  ->  u_soft, u_hard  (B, N)
+  ├─ TemporalContextBoundaryDetector  ->  u_soft, u_hard  (B, N)
   └─ SegmentLevelLayer  ->  segment_logits  (B, N, C)
 
 Stage 2: CLIP Alignment

@@ -10,6 +10,7 @@ model:
   prompt_ctx_init: "a photo of a person"  # initialization string for context vectors
   learnable_temp: true          # C6b: learnable temperature on cosine similarities
   use_simple_mlp: false         # ablation: use original 2-layer MLP (no dropout, no L2 norm)
+  boundary_kernel_size: 5        # kernel size for temporal context boundary detector (C1)
 
 training:
   epochs: 50
@@ -22,6 +23,7 @@ training:
   lambda2: 0.5                   # L_MI
   lambda3: 0.5                   # L_Cos
   lambda_ant: 0.0                # L_Anticipation (disabled — ablation showed better results without it)
+  lambda4: 0.1                   # L_PromptReg weight (C6b learnable prompts anchor)
 
   # EMA
   rho: 0.9                       
