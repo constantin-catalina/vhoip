@@ -26,6 +26,7 @@ C6b improvements over baseline:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 from typing import List, Optional, Dict
 import clip   # pip install git+https://github.com/openai/CLIP.git
 
@@ -62,6 +63,25 @@ class MLPProjection(nn.Module):
         """
         z_prime = self.mlp(z)
         return F.normalize(z_prime, dim=-1)   # L2 norm (din paper)
+
+
+class SimpleMLPProjection(nn.Module):
+    """
+    Original VHOIP MLP: two linear layers with GELU, no dropout, no L2 norm.
+    Used for ablation: w/o improved projection head.
+    """
+
+    def __init__(self, input_dim: int = 256, output_dim: int = 512):
+        super().__init__()
+        mid_dim = (input_dim + output_dim) // 2
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, mid_dim),
+            nn.GELU(),
+            nn.Linear(mid_dim, output_dim),
+        )
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.mlp(z)
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +323,7 @@ class CLIPTextEncoder(nn.Module):
         n_ctx: int = 16,
         ctx_init: str = "a photo of a person",
         num_classes: int = 0,   # required when use_learnable_prompts=True
+        learnable_temp: bool = True,
     ):
         super().__init__()
         self.device = device
@@ -320,12 +341,13 @@ class CLIPTextEncoder(nn.Module):
         for param in self.text_encoder.parameters():
             param.requires_grad = False
 
-        # Learnable temperature (log-space for stability).
-        # exp(log_temp) is the scale applied to cosine similarities.
-        # Start at 1.0 (log_temp=0) so training is stable at the beginning;
-        # the model can learn to scale up if needed.  Using float32 explicitly
-        # avoids accidental float64 promotion that breaks mixed-precision.
-        self.log_temp = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))  # learnable
+        # Temperature applied to cosine similarities.
+        # If learnable: log-space parameter starting at log(0.07) (CLIP default).
+        # If fixed: constant 1.0 (log_temp=0, no grad).
+        if learnable_temp:
+            self.log_temp = nn.Parameter(torch.tensor(np.log(0.07), dtype=torch.float32))  # learnable
+        else:
+            self.log_temp = nn.Parameter(torch.tensor(0.0, dtype=torch.float32), requires_grad=False)
 
         if use_learnable_prompts:
             assert num_classes > 0, "num_classes must be set when use_learnable_prompts=True"
@@ -348,8 +370,8 @@ class CLIPTextEncoder(nn.Module):
 
     @property
     def temperature(self) -> torch.Tensor:
-        """Positive temperature scalar: exp(log_temp)."""
-        return self.log_temp.clamp(max=3.5).exp()  
+        """Positive temperature scalar: exp(log_temp). Clamped to [0.01, 1.0]."""
+        return self.log_temp.clamp(min=-4.6, max=0.0).exp()  
     
     def precompute_frozen_T(
         self,

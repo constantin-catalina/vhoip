@@ -8,6 +8,8 @@ model:
   use_learnable_prompts: true    # C6b: CoOp-style learnable context vectors
   prompt_n_ctx: 16               # number of learnable context tokens
   prompt_ctx_init: "a photo of a person"  # initialization string for context vectors
+  learnable_temp: true          # C6b: learnable temperature on cosine similarities
+  use_simple_mlp: false         # ablation: use original 2-layer MLP (no dropout, no L2 norm)
 
 training:
   epochs: 50

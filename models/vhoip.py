@@ -37,6 +37,7 @@ from models.backbone import Backbone2GGCN
 from models.clip_modules import (
     CLIPTextEncoder,
     MLPProjection,
+    SimpleMLPProjection,
     IntegratedGlobalRepresentation,
     FeaturesCollector,
 )
@@ -88,11 +89,17 @@ class VHOIP(nn.Module):
         # -----------------------------------------------------------------------
         # MLP Projection Z -> Z'  (VHOIP §3.2)
         # -----------------------------------------------------------------------
-        self.mlp_proj = MLPProjection(
-            input_dim=cfg.model.hidden_dim,
-            output_dim=cfg.model.clip_dim,
-            dropout=cfg.model.dropout,
-        )
+        if getattr(cfg.model, "use_simple_mlp", False):
+            self.mlp_proj = SimpleMLPProjection(
+                input_dim=cfg.model.hidden_dim,
+                output_dim=cfg.model.clip_dim,
+            )
+        else:
+            self.mlp_proj = MLPProjection(
+                input_dim=cfg.model.hidden_dim,
+                output_dim=cfg.model.clip_dim,
+                dropout=cfg.model.dropout,
+            )
 
         # -----------------------------------------------------------------------
         # Discriminator MI  (Eq. 1 din paper)
@@ -113,6 +120,7 @@ class VHOIP(nn.Module):
             n_ctx=getattr(cfg.model, "prompt_n_ctx", 16),
             ctx_init=getattr(cfg.model, "prompt_ctx_init", "a photo of a person"),
             num_classes=cfg.model.num_classes,
+            learnable_temp=getattr(cfg.model, "learnable_temp", True),
         )
 
         # -----------------------------------------------------------------------
